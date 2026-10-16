@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+<properties>
+    <!-- Local prototype database. Keep the Docker data volume persistent. -->
+    <entry key="database.driver">org.h2.Driver</entry>
+    <entry key="database.url">jdbc:h2:./data/database</entry>
+    <entry key="database.user">sa</entry>
+    <entry key="database.password"></entry>
+    <entry key="database.registerUnknown">false</entry>
+
+    <!-- Only the phone client's OsmAnd protocol is needed. -->
+    <entry key="protocols.enable">osmand</entry>
+    <entry key="osmand.port">5055</entry>
+    <entry key="osmand.minAccuracy">0</entry>
+    <entry key="web.port">8082</entry>
+
+    <!-- Do not send tracked coordinates to external geocoding services. -->
+    <entry key="geocoder.enable">false</entry>
+    <entry key="geolocation.enable">false</entry>
+    <entry key="server.statistics"></entry>
+    <entry key="logger.level">info</entry>
+</properties>

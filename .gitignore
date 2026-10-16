@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+.data/
+.research/
+output/
+*.log
+*.tsbuildinfo
+.playwright-cli/
+.vscode/

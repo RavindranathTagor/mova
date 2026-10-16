@@ -1,0 +1,19 @@
+services:
+  traccar:
+    image: traccar/traccar:6.16.0-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8082:8082"
+      # Opt in to LAN phone uploads with TRACCAR_INGEST_BIND=<PC-LAN-IP>.
+      # Management/API port 8082 remains local even when phone ingress is enabled.
+      - "${TRACCAR_INGEST_BIND:-127.0.0.1}:5055:5055"
+    volumes:
+      - ./config/traccar.xml:/opt/traccar/conf/traccar.xml:ro
+      - mova-traccar-data:/opt/traccar/data
+      - mova-traccar-logs:/opt/traccar/logs
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  mova-traccar-data:
+  mova-traccar-logs:

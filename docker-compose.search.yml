@@ -1,0 +1,12 @@
+﻿services:
+  search:
+    image: searxng/searxng:latest
+    container_name: mova-search
+    ports:
+      - "127.0.0.1:8181:8080"
+    volumes:
+      - ./config/search:/etc/searxng:rw
+      - search-cache:/var/cache/searxng
+    restart: unless-stopped
+volumes:
+  search-cache:

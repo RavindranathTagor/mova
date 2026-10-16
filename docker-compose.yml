@@ -1,0 +1,11 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:v4.16.3
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - mova-graph:/data
+    command: ["redis-server", "--loadmodule", "/var/lib/falkordb/bin/falkordb.so", "--appendonly", "yes", "--save", "60", "1"]
+    restart: unless-stopped
+volumes:
+  mova-graph:
