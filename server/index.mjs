@@ -16,6 +16,7 @@ import { createWorkGraph } from './work-graph.mjs';
 import { createRemoteMcp } from './remote-mcp.mjs';
 import { createIncidentRouting } from './incident-routing.mjs';
 import { createOperationsGraph } from './operations-graph.mjs';
+import { resolveManualPlace, validPoint } from './geo.mjs';
 
 const resources=createResourceRegistry({path:join(process.env.MOVA_DATA_DIR||'.data','resources.json')});
 await resources.init();
@@ -163,6 +164,20 @@ app.post('/api/missions/:id/resume',route(async(req,res)=>res.json(await engine.
 app.post('/api/missions/:id/observe',route(async(req,res)=>res.json(await engine.observeRoutes(req.params.id))));
 app.post('/api/missions/:id/acknowledge',route(async(req,res)=>res.json(await engine.acknowledge(req.params.id,req.body))));
 app.post('/api/location',route(async(req,res)=>{const {latitude,longitude,accuracy,timestamp}=req.body;res.json(enrich(await engine.setLocation({latitude,longitude,accuracy,timestamp,source:'Authorized browser geolocation',evidenceKind:'observed'})));}));
+app.post('/api/location/manual',route(async(req,res)=>{
+  const query=typeof req.body?.query==='string'?req.body.query.trim().slice(0,300):'';
+  if(!query)throw Object.assign(new Error('Enter a city, address, or landmark.'),{status:400});
+  const found=await adapters.searchPlaces({query});
+  const place=resolveManualPlace(found,typeof req.body.placeId==='string'?req.body.placeId:undefined);
+  if(!place){
+    const candidates=(found.places||[]).filter(item=>validPoint(item.location)).slice(0,5).map(item=>({id:item.id,label:String(item.displayName?.text||item.name||query).slice(0,200),address:String(item.formattedAddress||item.address||'').slice(0,300)}));
+    if(!candidates.length)return res.json({location:null,candidates:[],message:'No matching location was returned. Try a more specific city, address, or landmark.'});
+    if(req.body.placeId)return res.status(400).json({error:'That location is no longer in the search results. Search again and select a current result.'});
+    return res.json({location:null,candidates,message:'Select the matching city or place so MOVA searches the correct area.'});
+  }
+  const point=validPoint(place.location);
+  return res.json({location:{...point,label:String(place.displayName?.text||place.name||query).slice(0,200),source:found.source||'Connected Places search',evidenceKind:'user-provided',timestamp:Date.now(),accuracy:null},candidates:[]});
+}));
 app.get('/api/tracking',(_req,res)=>res.json(enrich(engine.getState()).tracking));
 app.post('/api/tracking/refresh',route(async(_req,res)=>res.json(await refreshTracking())));
 app.post('/api/tracking/control',route(async(req,res)=>{if(typeof req.body.enabled!=='boolean')return res.status(400).json({error:'Tracking enabled must be a boolean.'});trackingEnabled=req.body.enabled;broadcast(engine.getState());res.json(enrich(engine.getState()));}));

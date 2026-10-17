@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { distanceMeters, validPoint } from './geo.mjs';
 
 const CALENDAR_READ = 'https://www.googleapis.com/auth/calendar.events.owned.readonly';
 const CALENDAR_WRITE = 'https://www.googleapis.com/auth/calendar.events.owned';
@@ -108,7 +109,7 @@ export function createAdapters({ env = process.env, fetchImpl = fetch } = {}) {
       const groqSelected = llmProvider === 'groq';
       const llmName = 'MOVA reasoning';
       const llmKeyConfigured = kiroSelected ? Boolean(env.KIRO_API_KEY) : groqSelected ? Boolean(env.GROQ_API_KEY || env.groq_api_for_api) : Boolean(env.GEMINI_API_KEY);
-      const tomtomIntegration = (id, service) => ({ id, name: service, status: health.get(service) || (env.TOMTOM_API_KEY ? verified.has(service) ? 'connected' : 'unavailable' : 'disconnected'), detail: env.TOMTOM_API_KEY ? verified.has(service) ? 'Last provider request succeeded. Traffic-aware results are estimates; coverage varies.' : 'Backend key configured; access has not yet been verified.' : 'Add TOMTOM_API_KEY on the backend.' });
+      const tomtomIntegration = (id, service) => ({ id, name: service, status: health.get(service) || (env.TOMTOM_API_KEY ? verified.has(service) ? 'connected' : 'unavailable' : 'disconnected'), detail: env.TOMTOM_API_KEY ? verified.has(service) ? id==='routes'?'Last TomTom route request succeeded. Traffic-aware results are estimates; coverage varies.':'Last TomTom Places request succeeded; results are coordinate and radius constrained.' : 'Backend key configured; access has not yet been verified.' : 'Add TOMTOM_API_KEY on the backend.' });
       return [
         { id: kiroSelected ? 'kiro' : groqSelected ? 'groq' : 'gemini', name: llmName, status: llmKeyConfigured ? 'unavailable' : 'disconnected', detail: llmKeyConfigured ? 'Configured; the MOVA model controller reports actual request health.' : kiroSelected ? 'Set KIRO_API_KEY and install the Kiro CLI for live MOVA decisions.' : 'Add a backend model API key for live MOVA decisions.' },
         { id: 'routes', name: mapsProvider === 'osm' ? 'OSRM · OpenStreetMap' : 'Google Routes', status: health.get(mapsProvider === 'osm' ? 'OSRM' : 'Google Routes') || (mapsProvider === 'osm' ? 'read_only' : env.GOOGLE_MAPS_SERVER_API_KEY ? verified.has('Google Routes') ? 'connected' : 'unavailable' : 'disconnected'), detail: mapsProvider === 'osm' ? `${verified.has('OSRM') ? 'Last route request succeeded.' : 'Public endpoint; not yet queried.'} Open driving estimates; no live traffic feed. Public service has no SLA.` : 'Optional Google adapter; key alone does not verify access.' },
@@ -196,6 +197,55 @@ export function createAdapters({ env = process.env, fetchImpl = fetch } = {}) {
     },
     async getCurrentRouteState() {
       return { status: 'unavailable', route: null, source: 'No connected navigation session', observedAt: stamp(), summary: 'Current turn-by-turn navigation state is not available. Recompute route estimates from an authorized location.' };
+    },
+    async searchNearbyPlaces({ query, location, radiusMeters = 5000, limit = 20 }) {
+      const center = validPoint(location);
+      if (!center) throw new Error('Nearby search requires a valid current or manually selected location.');
+      const text = requireText(query, 'nearby place query', 200);
+      if (!Number.isFinite(radiusMeters) || radiusMeters < 100 || radiusMeters > 50000) throw new Error('Nearby search radius must be between 100 m and 50 km.');
+      const resultLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 50)) : 20;
+      let rows;
+      let source;
+      if (mapsProvider === 'tomtom') {
+        if (!env.TOMTOM_API_KEY) throw new Error('TomTom Nearby Search is not configured. Add TOMTOM_API_KEY and enable Search API access for the key.');
+        const url = new URL(`https://api.tomtom.com/search/2/search/${encodeURIComponent(text)}.json`);
+        url.search = new URLSearchParams({ key: env.TOMTOM_API_KEY, lat: String(center.latitude), lon: String(center.longitude), radius: String(Math.round(radiusMeters)), limit: String(resultLimit), typeahead: 'false' }).toString();
+        const data = await jsonRequest(url, {}, 'TomTom Search');
+        if (!Array.isArray(data?.results)) throw new Error('TomTom returned an invalid nearby search response.');
+        rows = data.results.map(row => ({
+          id: row.id,
+          name: row.poi?.name,
+          address: row.address?.freeformAddress,
+          location: row.position && { latitude: row.position.lat, longitude: row.position.lon },
+          categories: row.poi?.categories,
+          phone: row.poi?.phone,
+          url: row.poi?.url,
+          openingHours: row.poi?.openingHours?.text || row.poi?.openingHours?.mode,
+        }));
+        source = 'TomTom Search API · coordinate and radius constrained';
+      } else if (mapsProvider === 'google') {
+        if (!env.GOOGLE_MAPS_SERVER_API_KEY) throw new Error('Google Places Nearby Search is not configured. Add GOOGLE_MAPS_SERVER_API_KEY and enable Places API (New).');
+        const typeMap = { restaurant: 'restaurant', restaurants: 'restaurant', cafe: 'cafe', cafes: 'cafe', pharmacy: 'pharmacy', pharmacies: 'pharmacy', hospital: 'hospital', hospitals: 'hospital', store: 'store', shops: 'store', shop: 'store', grocery: 'grocery_store', groceries: 'grocery_store', 'grocery stores': 'grocery_store', 'gas station': 'gas_station', 'gas stations': 'gas_station', 'petrol stations': 'gas_station', atm: 'atm', atms: 'atm', bank: 'bank', banks: 'bank', hotel: 'hotel', hotels: 'hotel', park: 'park', parks: 'park' };
+        const includedTypes = [...new Set(text.toLowerCase().split(/[,;]|\band\b/).map(value => typeMap[value.trim()]).filter(Boolean))];
+        if (!includedTypes.length) throw new Error('Google Places nearby search needs a supported place category such as restaurants, cafes, shops, pharmacies, or hospitals.');
+        const data = await jsonRequest('https://places.googleapis.com/v1/places:searchNearby', {
+          method: 'POST', headers: { 'content-type': 'application/json', 'X-Goog-Api-Key': env.GOOGLE_MAPS_SERVER_API_KEY, 'X-Goog-FieldMask': 'places.id,places.displayName,places.location,places.formattedAddress,places.primaryType,places.nationalPhoneNumber,places.rating,places.userRatingCount,places.websiteUri,places.regularOpeningHours' },
+          body: JSON.stringify({ includedTypes, maxResultCount: resultLimit, rankPreference: 'DISTANCE', locationRestriction: { circle: { center: { latitude: center.latitude, longitude: center.longitude }, radius: radiusMeters } } }),
+        }, 'Google Places Nearby Search');
+        if (data?.places != null && !Array.isArray(data.places)) throw new Error('Google Places returned an invalid nearby search response.');
+        rows = (data.places || []).map(place => ({ id: place.id, name: place.displayName?.text, address: place.formattedAddress, location: place.location, categories: place.primaryType ? [place.primaryType] : [], phone: place.nationalPhoneNumber, rating: place.rating, userRatingCount: place.userRatingCount, url: place.websiteUri, openingHours: place.regularOpeningHours?.weekdayDescriptions?.join('; ') }));
+        source = 'Google Places API (New) · nearby search';
+      } else {
+        throw new Error('Nearby place search requires MAPS_PROVIDER=tomtom with TOMTOM_API_KEY, or MAPS_PROVIDER=google with Places API (New) enabled and GOOGLE_MAPS_SERVER_API_KEY. OpenStreetMap geocoding alone cannot return nearby POIs.');
+      }
+      const places = rows.flatMap(row => {
+        const point = validPoint(row.location);
+        if (!point || typeof row.id !== 'string' || !row.id) return [];
+        const distance = distanceMeters(center, point);
+        if (distance > radiusMeters) return [];
+        return [{ id: row.id, name: String(row.name || row.address || text).slice(0, 200), address: String(row.address || '').slice(0, 500), location: point, distanceMeters: Math.round(distance), categories: Array.isArray(row.categories) ? row.categories.slice(0, 8) : [], ...(typeof row.phone === 'string' ? { phone: row.phone.slice(0, 80) } : {}), ...(typeof row.url === 'string' ? { url: row.url.slice(0, 500) } : {}), ...(typeof row.openingHours === 'string' ? { openingHours: row.openingHours.slice(0, 500) } : {}), ...(Number.isFinite(row.rating) ? { rating: row.rating } : {}), ...(Number.isFinite(row.userRatingCount) ? { userRatingCount: row.userRatingCount } : {}) }];
+      }).sort((a, b) => a.distanceMeters - b.distanceMeters).slice(0, resultLimit);
+      return { places, source, observedAt: stamp(), center, radiusMeters };
     },
     async searchPlaces({ query }) {
       if (mapsProvider === 'tomtom') {

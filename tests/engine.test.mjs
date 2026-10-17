@@ -94,6 +94,18 @@ test('actual FalkorDB approval and device arrival survive an engine restart',{sk
  const graph=createGraph({url:process.env.FALKORDB_TEST_URL});t.after(()=>graph.close());const f=await fixture(t,{graph});let s=await f.engine.createMission(input);assert.equal(s.mission.state,'AWAITING_APPROVAL');s=await f.engine.approve(s.mission.id,s.mission.revision);assert.ok(s.mission.graph.edges.some(e=>e.label==='AUTHORIZES'));const restarted=createEngine({store:f.store,graph,adapters:f.adapters,provider:f.provider});await restarted.init();s=await restarted.setLocation({...destination,accuracy:20,timestamp:Date.now()});assert.equal(s.mission.state,'RESOLVED');assert.ok(s.mission.graph.edges.some(e=>e.label==='VERIFIED_BY'));assert.equal(f.calls(),1);
 });
 
+test('nearby places use the supplied location, verify actual radius and distance, and finish without clarification',async t=>{
+ const center={latitude:28.6,longitude:77.2,label:'Current location',source:'Browser geolocation',evidenceKind:'observed'};let searchInput;
+ const f=await fixture(t,{provider:{compileIntent:async()=>({kind:'nearby_places',placeQuery:'restaurants',radiusMeters:1000,goal:'Find nearby restaurants',destinationQuery:'',summary:'Search nearby places'})},adapters:{searchNearbyPlaces:async input=>{searchInput=input;return{source:'TomTom Search API',observedAt:new Date().toISOString(),places:[{id:'close',name:'Verified nearby place',location:{latitude:28.601,longitude:77.201}},{id:'outside',name:'Outside radius',location:{latitude:29,longitude:78}}]};}}});
+ const state=await f.engine.createMission({text:'Find nearby restaurants',origin:center});
+ assert.equal(state.mission.kind,'nearby_places');assert.equal(state.mission.state,'RESOLVED');assert.deepEqual(searchInput.location,{latitude:28.6,longitude:77.2});assert.equal(searchInput.radiusMeters,1000);
+ assert.deepEqual(state.mission.result.places.map(place=>place.id),['close']);assert.ok(state.mission.result.places[0].distanceMeters>0);assert.ok(state.mission.receipts.some(receipt=>receipt.status==='VERIFIED'));
+});
+test('nearby places report empty real results and request a location only when none exists',async t=>{
+ const f=await fixture(t,{provider:{compileIntent:async()=>({kind:'nearby_places',placeQuery:'shops',radiusMeters:5000,goal:'Find shops',destinationQuery:'',summary:'Search shops'})},adapters:{searchNearbyPlaces:async()=>({source:'TomTom Search API',observedAt:new Date().toISOString(),places:[]})}});
+ const state=await f.engine.createMission({text:'Find nearby shops',origin});assert.equal(state.mission.state,'RESOLVED');assert.match(state.mission.summary,/No shops were returned/i);assert.deepEqual(state.mission.result.places,[]);
+ const noLocation=await f.engine.createMission({text:'Find nearby shops'});assert.equal(noLocation.mission.state,'BLOCKED');assert.match(noLocation.mission.summary,/enter a city or address/i);
+});
 test('explicit named origin overrides a different available device position',async t=>{
  const named={latitude:28.6129,longitude:77.2295};let routedOrigin;
  const f=await fixture(t,{provider:{compileIntent:async()=>({kind:'travel',originQuery:'India Gate',destinationQuery:'Airport',deadlineMinutes:90,summary:'Start at India Gate'})},adapters:{searchPlaces:async()=>({places:[{location:named,displayName:{text:'India Gate'}}],source:'Places fixture',observedAt:new Date().toISOString()}),calculateRoutes:async({origin})=>{routedOrigin=origin;return testRoutes();}}});
@@ -149,4 +161,49 @@ test('work context updates invalidate old evidence and rerun only the revised pl
  const workGraph={sync:async()=>{},snapshot:async()=>({nodes:[],edges:[]}),ready:async m=>({stepIds:m.work.steps.filter(s=>s.status==='pending').map(s=>s.id),query:'ready',params:{}})};
  const f=await fixture(t,{workTools,workGraph,provider:{compileIntent:async()=>({kind:'work',goal:'Research a topic',destinationQuery:'',summary:'Research'}),planWork:async()=>({status:'ready',summary:'Research',steps:[{id:'read',title:'Search',tool:'web_search',args:{query:'topic'},dependsOn:[]}]}),synthesizeWork:async({evidence})=>({answer:'Supported finding',title:'Research',sourceIds:[evidence[0].id]})}});
  let s=await f.engine.createMission({text:'Research a topic'});assert.equal(s.mission.kind,'work');assert.equal(s.mission.state,'RESOLVED');assert.equal(reads,1);s=await f.engine.updateWorkContext(s.mission.id,'Focus on a different constraint');assert.equal(s.mission.state,'RESOLVED');assert.equal(reads,2);assert.equal(s.mission.work.evidence[0].stale,true);assert.equal(s.mission.work.evidence.at(-1).stale,false);assert.equal(s.mission.revision,1);
+});
+
+test('an existing Discord issue request blocked as unsupported is reclassified and resumed as work',async t=>{
+ let intentCalls=0,reads=0;
+ const workTools={list:()=>[{name:'web_search',description:'Search connected evidence',effect:'read',inputSchema:{type:'object',properties:{query:{type:'string'}}}}],call:async()=>{reads++;return {source:'Connected search fixture',observedAt:new Date().toISOString(),results:[{title:'Verified repository evidence',summary:'A real connected source returned this result.'}]};}};
+ const workGraph={sync:async()=>{},snapshot:async()=>({nodes:[],edges:[]}),ready:async m=>({stepIds:m.work.steps.filter(s=>s.status==='pending').map(s=>s.id),query:'ready',params:{}})};
+ const f=await fixture(t,{workTools,workGraph,provider:{compileIntent:async()=>++intentCalls===1?{kind:'unsupported',summary:'External writes require approval.'}:{kind:'work',goal:'Prepare requested issue and Discord reply proposals',summary:'Gather evidence and prepare reviewable proposals.'},planWork:async()=>({status:'ready',steps:[{id:'read',title:'Gather connected evidence',tool:'web_search',args:{query:'requested feature'},dependsOn:[]}]}),synthesizeWork:async({evidence})=>({answer:'The connected source returned verified evidence. No external action was sent.',title:'Verified evidence',sourceIds:[evidence[0].id]})}});
+ let state=await f.engine.createMission({text:'Perform a task that is initially classified as unsupported',trigger:{service:'Discord',source:'Discord channel fixture',channelId:'123456789012345678',eventId:'discord:event-1',content:'@mova do an unsupported task'}});
+ assert.equal(state.mission.state,'BLOCKED');assert.equal(state.mission.kind,'unsupported');
+ const saved=await f.store.load(),stored=saved.missions.find(m=>m.id===state.mission.id);stored.goal='@mova make issues in that github repo and revert back in discord';stored.trigger.content=stored.goal;stored.kind='unsupported';stored.intent={kind:'unsupported',summary:'Old unsupported classification from the previous agent.'};await f.store.save(saved);
+ const restarted=createEngine({store:f.store,graph:f.graph,adapters:f.adapters,provider:f.provider,workTools,workGraph});await restarted.init();state=await restarted.resume(state.mission.id);
+ assert.equal(state.mission.kind,'work');assert.equal(state.mission.state,'RESOLVED');assert.equal(intentCalls,1,'approval-gated mention recovery does not wait on a second intent model call');assert.equal(reads,1);assert.equal(state.mission.work.proposals.length,0);
+ assert.ok(state.mission.trace.some(item=>item.title==='Discord request reclassified for investigation'));
+});
+test('submitting the same clarification twice does not revise, stale, or replan a mission again',async t=>{
+ let plans=0,reads=0;
+ const workTools={list:()=>[{name:'web_search',description:'Search',effect:'read',inputSchema:{type:'object',properties:{query:{type:'string'}}}}],call:async()=>{reads++;return {source:'Search fixture',observedAt:new Date().toISOString(),results:[{title:'Result',summary:'Current connected evidence.'}]};}};
+ const workGraph={sync:async()=>{},snapshot:async()=>({nodes:[],edges:[]}),ready:async m=>({stepIds:m.work.steps.filter(s=>s.status==='pending').map(s=>s.id),query:'ready',params:{}})};
+ const f=await fixture(t,{workTools,workGraph,provider:{compileIntent:async()=>({kind:'work',goal:'Research topic',summary:'Research'}),planWork:async()=>{plans++;return {status:'ready',steps:[{id:'read',title:'Read evidence',tool:'web_search',args:{query:'topic'},dependsOn:[]}]};},synthesizeWork:async({evidence})=>({answer:'Connected source confirms the current result.',title:'Verified result',sourceIds:[evidence[0].id]})}});
+ const first=await f.engine.createMission({text:'Research topic'});const id=first.mission.id;await f.engine.updateWorkContext(id,'Continue using connected repository evidence.');const afterFirst=(await f.store.load()).missions.find(m=>m.id===id);const revision=afterFirst.revision,updateCount=afterFirst.contextUpdates.length;await f.engine.updateWorkContext(id,'  Continue using connected repository evidence.  ');const afterDuplicate=(await f.store.load()).missions.find(m=>m.id===id);
+ assert.equal(afterDuplicate.revision,revision);assert.equal(afterDuplicate.contextUpdates.length,updateCount);assert.equal(plans,2,'initial request plus one genuine context revision');assert.equal(reads,2);assert.ok(afterDuplicate.trace.some(item=>item.title==='Repeated clarification ignored'));
+});
+test('startup recovers interrupted work investigations and resets only safe in-flight tool steps',async t=>{
+ const f=await fixture(t);const mission={id:'work-restart',title:'Interrupted work',goal:'Continue a research task',kind:'work',mode:'live',state:'VERIFYING',createdAt:new Date().toISOString(),receipts:[],trace:[],work:{steps:[{id:'read',title:'Read source',tool:'web_search',args:{query:'x'},dependsOn:[],status:'completed'}],evidence:[{id:'read-1',stepId:'read',source:'Verified source',summary:'Current evidence',stale:false}],artifacts:[],proposals:[]}};
+ await f.store.save({version:1,currentId:mission.id,missions:[mission],archivedMissions:[]});const restarted=createEngine({store:f.store,graph:f.graph,adapters:f.adapters,provider:f.provider,workTools:{},workGraph:{}});await restarted.init();
+ const recovered=restarted.getState().mission;assert.equal(recovered.state,'BLOCKED');assert.equal(recovered.work.steps[0].status,'completed');assert.match(recovered.summary,/interrupted before completion/i);assert.ok(recovered.trace.some(item=>item.title==='Work investigation recovered after restart'));
+});
+test('Continue investigation replans a blocked feature request and searches configured GitHub',async t=>{
+ const prior=process.env.GITHUB_ALLOWED_REPOSITORIES;process.env.GITHUB_ALLOWED_REPOSITORIES='owner/demo';t.after(()=>{if(prior===undefined)delete process.env.GITHUB_ALLOWED_REPOSITORIES;else process.env.GITHUB_ALLOWED_REPOSITORIES=prior;});
+ const schema=properties=>({type:'object',properties,additionalProperties:false});let plans=0,searches=0,synthesisNotes;
+ const workTools={list:()=>[
+  {name:'read_github_issues',description:'Search repository issues',inputSchema:schema({repository:{type:'string'},query:{type:'string'}})},
+  {name:'read_github_repository',description:'Read repository context',inputSchema:schema({repository:{type:'string'}})},
+  {name:'read_github_commits',description:'Read recent commits',inputSchema:schema({repository:{type:'string'}})},
+ ],call:async(name)=>{
+  if(name==='read_github_issues'){searches++;return {source:'GitHub issue search',observedAt:new Date().toISOString(),results:[{id:'empty-issues',title:'No matching issues',summary:'No issues matched the repository-scoped search.'}]};}
+  if(name==='read_github_repository')return {source:'GitHub repository',observedAt:new Date().toISOString(),results:[{title:'Repository',summary:'Repository evidence for feature support.'}]};
+  if(name==='read_github_commits')return {source:'GitHub commits',observedAt:new Date().toISOString(),results:[{title:'Commit',summary:'Recent implementation changes.'}]};
+  throw new Error(`Unexpected work tool ${name}`);
+ }};
+ const workGraph={sync:async()=>{},snapshot:async()=>({nodes:[],edges:[]}),ready:async m=>({stepIds:m.work.steps.filter(step=>step.status==='pending'&&step.dependsOn.every(id=>m.work.steps.find(dep=>dep.id===id)?.status==='completed')).map(step=>step.id),query:'ready',params:{}})};
+ const f=await fixture(t,{workTools,workGraph,provider:{compileIntent:async()=>({kind:'work',goal:'Investigate this request',summary:'Research the requested feature'}),planWork:async()=>{plans++;return plans===1?{status:'blocked',summary:'Which feature request should I analyze?',requiresUserInput:true,question:'Which rejected feature request?'}:{status:'blocked',summary:'The model still cannot identify the target.'};},synthesizeWork:async({evidence,notes})=>{synthesisNotes=notes;return {answer:'No matching issue was returned. Repository and commit evidence provide a useful alternative analysis.',title:'Feature evidence',sourceIds:[evidence.at(-1).id]};}},});
+ let state=await f.engine.createMission({text:'Investigate this request'});assert.equal(state.mission.state,'BLOCKED');assert.equal(state.mission.inputRequest.question,'Which rejected feature request?');
+ state=await f.engine.updateWorkContext(state.mission.id,'Analyze the rejected feature request for export support and explain whether the repository supports it.');
+ assert.equal(state.mission.state,'RESOLVED');assert.equal(searches,1);assert.equal(state.mission.inputRequest,undefined);assert.match(state.mission.work.answer,/useful alternative analysis/);assert.match(synthesisNotes[0],/No matching issues were returned/);
 });

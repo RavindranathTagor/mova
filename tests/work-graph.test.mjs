@@ -18,6 +18,10 @@ test('work graphs fail closed without a database and validate plans before write
   await assert.rejects(graph.sync(cycle), /cycle/);
   const missing = mission(); missing.work.steps[1].dependsOn = ['missing'];
   await assert.rejects(graph.sync(missing), /Unknown work dependency/);
+  const orphan = mission(); orphan.work.evidence[0].stepId = 'missing';
+  await assert.rejects(graph.sync(orphan), /Active evidence .* references unknown work step missing/);
+  const staleOrphan = mission(); staleOrphan.work.evidence[0].stepId = 'old-plan'; staleOrphan.work.evidence[0].stale = true;
+  await assert.rejects(graph.sync(staleOrphan), /unavailable/, 'explicitly stale evidence is retained without graph attachment');
   const deep = mission(); deep.work.steps = Array.from({ length: 8 }, (_, i) => ({ id: `s${i}`, title: `Step ${i}`, tool: 'read_web_page', args: {}, dependsOn: i ? [`s${i - 1}`] : [], status: 'pending' })); deep.work.evidence = [];
   await assert.rejects(graph.sync(deep), /depth/);
   assert.throws(() => createWorkGraph({ prefix: 'unsafe:prefix' }), /prefix/);

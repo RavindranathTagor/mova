@@ -61,6 +61,13 @@ test('owned Slack and Discord channels are allowlisted before their messages can
  await assert.rejects(tools.call('read_discord_channel',{channelId:'D999'}),/allowlisted/);
 });
 
+test('Discord mention missions retain the complete raw multi-line request',async()=>{
+ const request='<@999999999999999999> @mova refer agents-playground repo and create two GitHub issues:\nIssue 1: feature 1 system architecture design\nIssue 2: small game required\nCreate these issues in that GitHub repo and reply in Discord.';
+ const tools=createWorkTools({env:{MOVA_GRAPH_DATA_ATTESTATION:'public_or_owned',DISCORD_BOT_TOKEN:'discord-secret',DISCORD_BOT_USER_ID:'999999999999999999',DISCORD_ALLOWED_CHANNEL_IDS:'1559991811965984890'},fetchImpl:async()=>new Response(JSON.stringify([{id:'message-1',content:request,author:{id:'user-1'},mentions:[{id:'999999999999999999'}],timestamp:'2026-10-18T01:10:00.000Z'}]))});
+ const events=await tools.listMentions();const mention=events.find(event=>event.eventId==='discord:1559991811965984890:message-1');
+ assert.ok(mention);assert.equal(mention.content,request);assert.match(mention.content,/Issue 1: feature 1 system architecture design/);assert.match(mention.content,/Issue 2: small game required/);assert.match(mention.content,/reply in Discord/);
+});
+
 test('chat-source reads require an explicit public-or-owned graph attestation', async () => {
  const tools=createWorkTools({env:{SLACK_BOT_TOKEN:'slack-secret',SLACK_ALLOWED_CHANNEL_IDS:'C123'},fetchImpl:async()=>new Response(JSON.stringify({ok:true,messages:[]}))});
  await assert.rejects(tools.call('read_slack_channel',{channelId:'C123'}),/public or owned/i);
@@ -96,6 +103,22 @@ test('GitHub issues are created only from an approved issue proposal', async () 
  assert.equal(receipt.status,'VERIFIED');assert.equal(receipt.remoteId,'19');assert.equal(receipt.url,'https://github.com/mova/demo/issues/19');
  assert.equal(calls[0].url,'https://api.github.com/repos/mova/demo/issues');
  assert.deepEqual(JSON.parse(calls[0].body),{title:'PDF export fails with video',body:'Customer report from Discord.',labels:['customer-report']});
+});
+
+test('GitHub issue search is repository scoped and returns real issue identifiers', async () => {
+ const calls=[];
+ const tools=createWorkTools({env:{GITHUB_TOKEN:'github-secret',GITHUB_ALLOWED_REPOSITORIES:'mova/demo'},fetchImpl:async(url)=>{
+  calls.push(String(url));
+  if(String(url).startsWith('https://api.github.com/search/issues?'))return new Response(JSON.stringify({items:[{number:42,title:'Tool results disappear',body:'Results are missing after the next step.',state:'open',html_url:'https://github.com/mova/demo/issues/42'}]}));
+  if(String(url).endsWith('/issues/42/comments?per_page=12&sort=created&direction=asc'))return new Response('[]');
+  throw new Error(`Unexpected GitHub request ${url}`);
+ }});
+ const result=await tools.call('read_github_issues',{repository:'mova/demo',query:'tool results disappear'});
+ assert.equal(result.results[0].issueNumber,42);assert.equal(result.results[0].repository,'mova/demo');
+ assert.equal(result.results[0].url,'https://github.com/mova/demo/issues/42');
+ assert.match(new URL(calls[0]).searchParams.get('q'),/repo:mova\/demo/);
+ assert.match(new URL(calls[0]).searchParams.get('q'),/tool results disappear/);
+ assert.match(result.source,/github\.com\/mova\/demo\/issues\?q=/);
 });
 
 test('GitHub source code is read only from an allowlisted repository and is bounded evidence', async () => {

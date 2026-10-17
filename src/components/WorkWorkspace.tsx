@@ -23,6 +23,12 @@ export default function WorkWorkspace({mission,busy,onUpdate,onResolveAction}:{m
   const actionTitle=(proposal:WorkProposal)=>proposal.operation==='create_issue'?`Create GitHub issue: ${proposal.title||'Untitled issue'}`:proposal.operation==='create_commit'?`Commit ${proposal.files?.length||0} file${proposal.files?.length===1?'':'s'} to ${proposal.repository} · ${proposal.branch}`:proposal.operation==='comment_on_pull_request'?`Comment on ${proposal.repository} #${proposal.pullNumber}`:proposal.operation==='comment_on_issue'?`Comment on ${proposal.repository} #${proposal.issueNumber}`:`Post to channel ${proposal.channelId}`;
   const actionPrompt=(proposal:WorkProposal)=>proposal.operation==='create_issue'?`Create this GitHub issue in ${proposal.repository}?`:proposal.operation==='create_commit'?`Commit these reviewed changes to ${proposal.repository} on ${proposal.branch}?`:proposal.operation==='comment_on_pull_request'?`Post a GitHub comment on ${proposal.repository} #${proposal.pullNumber}?`:proposal.operation==='comment_on_issue'?`Post a GitHub comment on ${proposal.repository} #${proposal.issueNumber}?`:`Post this message to ${proposal.service}?`;
   const actionBody=(proposal:WorkProposal)=>proposal.operation==='create_commit'?`${proposal.message||'Untitled commit'}\n\n${(proposal.files||[]).map(file=>`FILE: ${file.path}\n${file.content}`).join('\n\n')}`:proposal.body||proposal.text||'';
+  useEffect(()=>{
+    if(!selectedProposal)return;
+    const latest=work?.proposals?.find(proposal=>proposal.id===selectedProposal.id);
+    if(!latest||latest.status!=='PENDING_APPROVAL')setSelectedProposal(undefined);
+    else if(latest!==selectedProposal)setSelectedProposal(latest);
+  },[work?.proposals,selectedProposal]);
   useEffect(()=>{if(selectedProposal)actionDialog.current?.showModal();else actionDialog.current?.close();},[selectedProposal]);
   const completed=work?.steps.filter(step=>step.status==='completed').length||0;
   const download=(title:string,content:string)=>{const url=URL.createObjectURL(new Blob([content],{type:'text/markdown;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download=title.replace(/[^a-z0-9 -]/gi,'').slice(0,80)+'.md';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
