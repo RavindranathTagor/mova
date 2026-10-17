@@ -1,5 +1,6 @@
 import {approveWorkProposal,runWorkMission} from './work-engine.mjs';
 import {connectedResources} from './resource-registry.mjs';
+import { distanceMeters, validPoint } from './geo.mjs';
 ﻿import { randomUUID, createHash } from 'node:crypto';
 
 const tools = [
@@ -107,6 +108,13 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
     try {
       if(!graph.status().connected)throw new Error('Connect FalkorDB before starting a live mission.');
       if(!provider?.configured)throw new Error(`Connect ${provider?.name||'a model provider'} before starting live reasoning.`);
+      const mentionText=`${mission.trigger?.content||''}\n${mission.originalGoal||mission.goal}`;
+      const approvalGatedDiscordWork=['unsupported','pending'].includes(mission.kind)&&(mission.kind==='unsupported'||!mission.intent)&&mission.trigger?.service==='Discord'&&/\b(?:create|make|open|file|draft|prepare)\b.{0,100}\b(?:github\s+)?issues?\b/i.test(mentionText)&&/\b(?:send|post|message|reply|revert back)\b.{0,100}\bdiscord\b/i.test(mentionText);
+      if(approvalGatedDiscordWork){
+        mission.kind='work';mission.intent={kind:'work',goal:mission.goal,destinationQuery:'',summary:'The verified Discord request asks MOVA to gather repository evidence and prepare GitHub issue and Discord reply proposals for explicit approval.'};
+        mission.successCriteria='Gather connected repository evidence and prepare only reviewable proposals. Do not create issues or send messages before user approval.';
+        trace(mission,'agent','Discord request reclassified for investigation','The mention requests GitHub issue drafts and a Discord reply. MOVA will gather evidence and prepare approval-gated proposals; no external write will be sent automatically.',{source:'Verified Discord mention'});
+      }
       if(!mission.intent){
         if(!provider.compileIntent)throw new Error('The configured provider cannot compile a travel mission.');
         await transition(mission,'INVESTIGATING',`${provider.name||'The connected model'} is interpreting your request and checking supported tools.`);
@@ -115,17 +123,19 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
         if(mission.kind==='unsupported')throw new Error(intent.summary||'This task is not supported by the connected travel, weather, or calendar read tools.');
         if(mission.kind==='travel'&&intent.originQuery){const places=await bounded(adapters.searchPlaces({query:intent.originQuery}));const place=resolvedPlace(places,'starting place');if(!place?.location||!Number.isFinite(place.location.latitude)||!Number.isFinite(place.location.longitude))throw new Error('The named starting place could not be resolved. Specify a more precise starting place.');mission.origin={...place.location,label:place.displayName?.text||intent.originQuery,source:places.source,evidenceKind:'user-provided',observedAt:places.observedAt};}
         if(mission.kind==='travel'&&!mission.origin)throw new Error('Share your authorized current location before starting travel.');
-        if(mission.kind==='travel'&&!mission.deadlineExplicit){
-          if(!Number.isFinite(intent.deadlineMinutes)||intent.deadlineMinutes<=0||intent.deadlineMinutes>1440)throw new Error('Specify a deadline in your mission before continuing.');
-          mission.deadline=new Date(new Date(mission.createdAt).getTime()+intent.deadlineMinutes*60000).toISOString();
-        }
+        if(mission.kind==='travel'&&!mission.deadlineExplicit&&Number.isFinite(intent.deadlineMinutes)&&intent.deadlineMinutes>0&&intent.deadlineMinutes<=1440)mission.deadline=new Date(new Date(mission.createdAt).getTime()+intent.deadlineMinutes*60000).toISOString();
         mission.intent=intent;
         if(intent.goal){const title=intent.goal.trim();mission.title=title.length>120?title.slice(0,120).replace(/\s+\S*$/,''):title;}
         mission.successCriteria=mission.kind==='travel'?'Arrive within 500 m of the specified destination before the deadline minus 15 minutes. This does not verify boarding.':mission.kind==='weather'?'Retrieve current weather from the connected source.':mission.kind==='work'?'Produce the requested answer or local deliverable using verified tool evidence.':'Read upcoming events from the authorized calendar.';
+        if(mission.kind==='nearby_places')mission.successCriteria='Return real places from the configured Places API within the requested radius of the authorized current or manually selected location, with verified coordinates and distances.';
         trace(mission,'agent','Mission understood',intent.summary,{source:'Model intent extraction'});
         await persist();
       }
       await transition(mission,'BUILDING_CONTEXT','Gathering the connected context needed for this investigation.');
+      if(mission.kind==='nearby_places'){
+        await performNearbyPlaces(mission,bounded);
+        return;
+      }
       if(mission.kind==='work'){
         if(mission.operationalContext?.kind==='customer_incident'&&!mission.operationalContext.reportId)delete mission.operationalContext;
         mission.connectedResources=connectedResources();
@@ -238,18 +248,35 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
     }catch(error){
       cycleActive=false;
       mission.selectedPlanId=null;
-      if(mission.kind==='work'&&!mission.inputRequest){
-        const blocker=String(error?.message||'The investigation could not continue.').slice(0,500);
-        mission.inputRequest={
-          question:`MOVA could not continue: ${blocker}`,
-          placeholder:'Add the missing identifier, choose a different source, or change the requested outcome.',
-          options:['Use a different connected source','Narrow the requested outcome','Stop this investigation'],
-          reason:blocker,
-        };
-      }
+      if(mission.kind==='work')delete mission.inputRequest;
       trace(mission,'error','Mission needs attention',error.message,{status:'FAILED'});
       await transition(mission,'BLOCKED',error.message);
     }finally{cycleActive=false;if(toolSession)await toolSession.close();}
+  }
+  async function performNearbyPlaces(mission,bounded){
+    const center=validPoint(mission.origin);
+    if(!center)throw new Error('Location is needed for a nearby search. Allow browser location or enter a city or address.');
+    const query=typeof mission.intent?.placeQuery==='string'&&mission.intent.placeQuery.trim()?mission.intent.placeQuery.trim():'points of interest';
+    const radiusMeters=Number.isFinite(mission.intent?.radiusMeters)?mission.intent.radiusMeters:5000;
+    if(typeof adapters.searchNearbyPlaces!=='function')throw new Error('Nearby place search is unavailable. Configure TomTom Search (TOMTOM_API_KEY) or Google Places API (New) (GOOGLE_MAPS_SERVER_API_KEY).');
+    await transition(mission,'PLANNING',`Searching for ${query} within ${Math.round(radiusMeters/100)/10} km of ${mission.origin.label||'your selected location'}.`);
+    await transition(mission,'EXECUTING','Retrieving nearby places from the configured Places API.');
+    trace(mission,'tool','Nearby places search started',`Searching for ${query} within ${radiusMeters} m of verified coordinates.`,{tool:'search_nearby_places',source:mission.origin.source||'Authorized location',result:{latitude:center.latitude,longitude:center.longitude,radiusMeters}});
+    const output=await bounded(adapters.searchNearbyPlaces({query,location:center,radiusMeters,limit:20}));
+    if(!output||typeof output.source!=='string'||!Number.isFinite(Date.parse(output.observedAt))||!Array.isArray(output.places))throw new Error('The Places API returned an invalid or unverifiable nearby search response.');
+    const places=output.places.flatMap(place=>{
+      const point=validPoint(place.location);if(!point)return[];
+      const distance=distanceMeters(center,point);if(distance>radiusMeters)return[];
+      return [{...place,location:point,distanceMeters:Math.round(distance)}];
+    }).sort((a,b)=>a.distanceMeters-b.distanceMeters).slice(0,20);
+    mission.result={...output,center,radiusMeters,places};
+    await transition(mission,'VERIFYING','Verifying place coordinates, requested radius, and distances.');
+    const event={id:randomUUID(),type:'nearby_places',at:Date.parse(output.observedAt),source:output.source,evidenceKind:'observed',value:{query,center,radiusMeters,placeCount:places.length}};
+    mission.observations.push(event);
+    try{await bounded(graph.seed(mission));}catch(error){trace(mission,'error','Nearby results graph update unavailable',String(error.message||error),{source:'FalkorDB',status:'UNKNOWN'});}
+    const receipt={id:randomUUID(),tool:'search_nearby_places',status:'VERIFIED',at:stamp(),summary:`Places API returned ${places.length} verified result${places.length===1?'':'s'} within ${radiusMeters} m.`,revision:mission.revision,verification:{source:output.source,observationId:event.id,evidenceKind:'observed'}};
+    mission.receipts.push(receipt);
+    await transition(mission,'RESOLVED',places.length?`Found ${places.length} real ${query} result${places.length===1?'':'s'} within ${Math.round(radiusMeters/100)/10} km of ${mission.origin.label||'your selected location'}, sorted by distance.`:`No ${query} were returned within ${Math.round(radiusMeters/100)/10} km. Try a wider radius or another place category.`);
   }
   async function performRead(mission,bounded){
     let output;
@@ -293,7 +320,23 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
   }
   return {getState,
     hasMentionEvent(eventId){return (typeof eventId==='string'&&state.missions.some(mission=>mission.trigger?.eventId===eventId))||Boolean(state.archivedMissions?.some(mission=>mission.trigger?.eventId===eventId));},
-    updateWorkContext(id,text){return serialize(async()=>{const mission=find(id);if(mission.kind!=='work')throw errorWithStatus('Context updates require a work mission.');if(typeof text!=='string'||!text.trim()||text.length>2000)throw errorWithStatus('Provide a context update between 1 and 2000 characters.');mission.originalGoal||=mission.goal;mission.contextUpdates||=[];mission.contextUpdates.push({text:text.trim(),at:stamp()});mission.goal=`Original objective: ${mission.originalGoal}\nUpdates (oldest to newest):\n${mission.contextUpdates.slice(-8).map(item=>item.text).join('\n')}`;mission.revision++;delete mission.inputRequest;mission.work||={steps:[],evidence:[],artifacts:[],proposals:[]};mission.work.evidence=mission.work.evidence.map(e=>({...e,stale:true}));mission.work.artifacts=mission.work.artifacts.map(a=>({...a,stale:true}));mission.work.proposals=(mission.work.proposals||[]).map(item=>item.status==='PENDING_APPROVAL'?{...item,status:'STALE',resolvedAt:stamp()}:item);mission.work.steps=[];delete mission.work.synthesis;delete mission.work.answer;delete mission.work.completedAt;await transition(mission,'REPLANNING','The updated context requires fresh evidence and a revised tool plan.');await investigate(mission);return getState();});},
+    updateWorkContext(id,text){return serialize(async()=>{
+      const mission=find(id);if(mission.kind!=='work')throw errorWithStatus('Context updates require a work mission.');
+      if(typeof text!=='string'||!text.trim()||text.length>2000)throw errorWithStatus('Provide a context update between 1 and 2000 characters.');
+      const value=text.trim(),normalize=input=>input.replace(/\s+/g,' ').toLocaleLowerCase();
+      mission.contextUpdates||=[];
+      if(mission.contextUpdates.some(item=>normalize(item.text)===normalize(value))){
+        delete mission.inputRequest;trace(mission,'decision','Repeated clarification ignored','This same instruction was already applied to this investigation. Keeping its existing evidence and plan.');
+        await persist();return getState();
+      }
+      mission.originalGoal||=mission.goal;mission.contextUpdates.push({text:value,at:stamp()});
+      mission.goal=`Original objective: ${mission.originalGoal}\nUpdates (oldest to newest):\n${mission.contextUpdates.slice(-8).map(item=>item.text).join('\n')}`;
+      mission.revision++;delete mission.inputRequest;mission.work||={steps:[],evidence:[],artifacts:[],proposals:[]};
+      mission.work.evidence=mission.work.evidence.map(e=>({...e,stale:true}));mission.work.artifacts=mission.work.artifacts.map(a=>({...a,stale:true}));
+      mission.work.proposals=(mission.work.proposals||[]).map(item=>item.status==='PENDING_APPROVAL'?{...item,status:'STALE',resolvedAt:stamp()}:item);
+      mission.work.steps=[];delete mission.work.synthesis;delete mission.work.answer;delete mission.work.completedAt;
+      await transition(mission,'REPLANNING','The updated context requires fresh evidence and a revised tool plan.');await investigate(mission);return getState();
+    });},
     resolveWorkProposal(id,proposalId,revision,outcome){return serialize(async()=>{
       const mission=find(id);if(mission.kind!=='work')throw errorWithStatus('Action proposals require a connected-data mission.',409);
       if(!['approve','reject'].includes(outcome))throw errorWithStatus('Choose approve or reject.',400);
@@ -318,7 +361,8 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
     });},
     selectMission(id){return serialize(async()=>{find(id);await persist();return getState();});},
     async init(){state=await store.load();state.missions||=[];state.archivedMissions||=[];const savedCurrentId=state.currentId;const retired=state.missions.filter(m=>m.mode!=='live');state.archivedMissions.push(...retired);state.missions=state.missions.filter(m=>m.mode==='live');state.currentId=state.missions.some(m=>m.id===savedCurrentId)?savedCurrentId:null;await graph.init();for(const mission of state.missions){mission.kind||=mission.intent?.kind||'travel';
-      if(mission.state==='EXECUTING'){mission.state=mission.kind==='work'?'BLOCKED':'UNKNOWN';mission.summary='An action was interrupted. Its effect must be reconciled before retrying.';for(const receipt of mission.receipts)if(receipt.status==='PENDING')receipt.status='UNKNOWN';}
+      if(mission.kind==='work'&&['INVESTIGATING','BUILDING_CONTEXT','PLANNING','REPLANNING','EXECUTING','VERIFYING'].includes(mission.state)){mission.state='BLOCKED';mission.summary='The investigation was interrupted before completion. Resume to continue from its saved evidence.';mission.agentStatus='blocked';for(const step of mission.work?.steps||[])if(step.status==='running')step.status='pending';trace(mission,'state','Work investigation recovered after restart',mission.summary);}
+      else if(mission.state==='EXECUTING'){mission.state='UNKNOWN';mission.summary='An action was interrupted. Its effect must be reconciled before retrying.';for(const receipt of mission.receipts)if(receipt.status==='PENDING')receipt.status='UNKNOWN';}
     }await persist();return getState();},
     createMission(input,{background=false}={}){return serialize(async()=>{
       if(!input||typeof input.text!=='string'||!input.text.trim()||input.text.length>2000)throw errorWithStatus('Enter a mission between 1 and 2000 characters.');

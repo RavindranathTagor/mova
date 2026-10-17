@@ -4,13 +4,15 @@ import { startTransition } from 'react';
 import Avatar from './components/Avatar';
 import Bubble from './components/Bubble';
 import MissionMap from './components/MissionMap';
+import NearbyMap from './components/NearbyMap';
 import WorkWorkspace from './components/WorkWorkspace';
 import ActivityTrace from './components/ActivityTrace';
 import ExecutionConsole from './components/ExecutionConsole';
 import FalkorComparison from './components/FalkorComparison';
 import { Connections } from './components/Connections';
 import Workflows,{WorkflowPicker,type Workflow} from './components/Workflows';
-import type { Envelope, GraphNode, GraphEdge, Mission } from './types';
+import { isNearbyPlaceRequest, locationErrorMessage, locationRequiredForRequest, readBrowserLocation } from './location.mjs';
+import type { Envelope, GraphNode, GraphEdge, Mission, WorkProposal } from './types';
 
 const empty:Envelope={mission:null,integrations:[],config:{},missions:[]};
 type ApiResponse=Record<string,unknown>&{mission?:Mission|null};
@@ -22,7 +24,7 @@ async function responseBody(response:Response){
   try{return JSON.parse(text) as ApiResponse;}catch{throw new Error(`The MOVA server returned an invalid response (${response.status}). Restart the server and try again.`);}
 }
 const activeStates=['DETECTED','MISSION_CREATED','BUILDING_CONTEXT','INVESTIGATING','PLANNING','POLICY_CHECK','EXECUTING','REPLANNING'];
-type Location={latitude:number;longitude:number;accuracy:number;timestamp:number};
+type Location={latitude:number;longitude:number;accuracy:number|null;timestamp:number;label?:string;source?:string;evidenceKind?:string};
 type Page='mission'|'connections'|'activity'|'comparison'|'history'|'workflows';
 const missionHeading=(mission:Mission)=>mission.kind==='weather'&&mission.intent?.destinationQuery
   ?`Get current weather information for ${mission.intent.destinationQuery}`
@@ -55,6 +57,9 @@ export default function App(){
   function useWorkflow(workflow:Workflow){setWorkflowId(workflow.id);setText('');setCompose(true);selectMission(undefined);setPage('mission');}
   const [deadline,setDeadline]=useState('');
   const [location,setLocation]=useState<Location>();
+  const [manualLocationQuery,setManualLocationQuery]=useState('');
+  const [manualLocationCandidates,setManualLocationCandidates]=useState<{id:string;label:string;address:string}[]>([]);
+  const [needsManualLocation,setNeedsManualLocation]=useState(false);
   const [selected,setSelected]=useState<string>();
   const [inspected,setInspected]=useState<GraphNode|GraphEdge|null>(null);
   const [expanded,setExpanded]=useState(false);
@@ -62,18 +67,43 @@ export default function App(){
   const [monitoring,setMonitoring]=useState(true);
   const [needsInput,setNeedsInput]=useState(false);
   const [inputText,setInputText]=useState('');
+  const [attentionMission,setAttentionMission]=useState<Mission|null>(null);
+  const [selectedProposal,setSelectedProposal]=useState<WorkProposal>();
+  const shownClarifications=useRef(new Set<string>());
+  const shownProposals=useRef(new Set<string>());
   const creatingMission=useRef(false);
   const streamEnvelope=useRef<Envelope|null>(null);
   const streamFrame=useRef<number|null>(null);
   const dialog=useRef<HTMLDialogElement>(null);
   const inputDialog=useRef<HTMLDialogElement>(null);
+  const actionDialog=useRef<HTMLDialogElement>(null);
   const mission=selectedMissionId&&data.mission?.id===selectedMissionId&&data.mission.mode==='live'?data.mission:null;
+  const popupMission=attentionMission?.mode==='live'?attentionMission:mission;
+  const bannerMission=popupMission?.id===selectedMissionId?popupMission:null;
+  const bannerInput=bannerMission?.inputRequest||null;
+  const bannerProposals=bannerMission?.work?.proposals?.filter(item=>item.status==='PENDING_APPROVAL')||[];
   const travel=mission?.kind==='travel';
   const work=mission?.kind==='work';
   const missionNeedsAttention=['BLOCKED','FAILED_RETRYABLE','UNKNOWN'].includes(mission?.state||'');
-  const inputPrompt=mission?.inputRequest||{question:mission?.summary||'What should MOVA use to continue?',options:[] as string[]};
+  const popupInput=popupMission?.inputRequest||null;
+  const inputPrompt=popupInput||{question:popupMission?.summary||mission?.summary||'What should MOVA use to continue?',options:[] as string[]};
+  const pendingProposals=popupMission?.work?.proposals?.filter(item=>item.status==='PENDING_APPROVAL')||[];
+  const proposalTitle=(proposal:WorkProposal)=>proposal.operation==='create_issue'?`Create GitHub issue: ${proposal.title||'Untitled issue'}`:proposal.operation==='create_commit'?`Commit ${proposal.files?.length||0} file${proposal.files?.length===1?'':'s'} to ${proposal.repository} · ${proposal.branch}`:proposal.operation==='comment_on_pull_request'?`Comment on ${proposal.repository} #${proposal.pullNumber}`:proposal.operation==='comment_on_issue'?`Comment on ${proposal.repository} #${proposal.issueNumber}`:`Post this message to ${proposal.service}?`;
+  const proposalBody=(proposal:WorkProposal)=>proposal.operation==='create_commit'?`${proposal.message||'Untitled commit'}\n\n${(proposal.files||[]).map(file=>`FILE: ${file.path}\n${file.content}`).join('\n\n')}`:proposal.body||proposal.text||'';
   const position=data.tracking?.enabled&&!data.tracking?.error?data.tracking?.position:null;
+  function updateAttention(incoming:Mission|null|undefined){
+    if(!incoming)return;
+    const pending=incoming.work?.proposals?.some(item=>item.status==='PENDING_APPROVAL');
+    if(incoming.inputRequest?.question||pending||incoming.kind==='work'&&incoming.state==='BLOCKED')setAttentionMission(incoming);
+    else setAttentionMission(current=>current?.id===incoming.id?incoming:current);
+  }
+  function claimPopup(key:string,shown:Set<string>){
+    if(shown.has(key))return false;
+    try{if(sessionStorage.getItem(key)){shown.add(key);return false;}sessionStorage.setItem(key,'1');}catch{}
+    shown.add(key);return true;
+  }
   function receiveState(incoming:Envelope){
+    updateAttention(incoming.mission);
     setData(previous=>{
       if(selectedMissionIdRef.current&&incoming.mission?.id!==selectedMissionIdRef.current)return {...incoming,mission:previous.mission,tracking:incoming.tracking||previous.tracking};
       return mergeEnvelope(previous,incoming);
@@ -101,35 +131,74 @@ export default function App(){
     return()=>clearInterval(timer);
   },[mission?.id,mission?.state,travel,monitoring]);
   useEffect(()=>{if(inspected||expanded){dialog.current?.showModal();}else dialog.current?.close();},[inspected,expanded]);
-  useEffect(()=>{if(mission?.state==='BLOCKED'&&mission.inputRequest?.question)setNeedsInput(true);},[mission?.id,mission?.revision,mission?.state,mission?.inputRequest?.question]);
+  useEffect(()=>{
+    if(popupMission?.kind!=='work'||popupMission.state!=='BLOCKED'||!popupMission.inputRequest?.question)return;
+    if(claimPopup(`mova:clarification-shown:${popupMission.id}`,shownClarifications.current))setNeedsInput(true);
+  },[popupMission?.id,popupMission?.state,popupMission?.inputRequest?.question]);
+  useEffect(()=>{
+    if(selectedProposal)return;
+    const next=pendingProposals.find(proposal=>!shownProposals.current.has(proposal.id));
+    if(next&&claimPopup(`mova:proposal-shown:${next.id}`,shownProposals.current))setSelectedProposal(next);
+  },[pendingProposals,selectedProposal]);
+  useEffect(()=>{
+    if(!selectedProposal)return;
+    const latest=pendingProposals.find(proposal=>proposal.id===selectedProposal.id);
+    if(!latest)setSelectedProposal(undefined);
+    else if(latest!==selectedProposal)setSelectedProposal(latest);
+  },[pendingProposals,selectedProposal]);
   useEffect(()=>{if(needsInput)inputDialog.current?.showModal();else inputDialog.current?.close();},[needsInput]);
-  function selectMission(id?:string){selectedMissionIdRef.current=id;setSelectedMissionId(id);}
+  useEffect(()=>{if(selectedProposal)actionDialog.current?.showModal();else actionDialog.current?.close();},[selectedProposal]);
+  function selectMission(id?:string){selectedMissionIdRef.current=id;setSelectedMissionId(id);setAttentionMission(current=>current?.id===id?current:null);}
   async function request(path:string,body:unknown,foreground=true){
     if(foreground){setBusy(path);setError('');}
     try{
       const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','x-mova-client':'web'},body:JSON.stringify(body)});
       const result=await responseBody(response);
       if(!response.ok)throw new Error(String(result.error||'The request could not complete.'));
-      if('mission'in result)setData(old=>mergeEnvelope(old,result as Envelope));
+      if('mission'in result){const envelope=result as Envelope;updateAttention(envelope.mission);setData(old=>mergeEnvelope(old,envelope));}
       return result;
     }catch(e){setError((e as Error).message);return null;}finally{if(foreground)setBusy('');}
   }
-  function locate(){
-    if(!navigator.geolocation){setError('Location is unavailable in this browser. Connect your phone through Traccar.');return;}
+  async function locate(){
     setNotice('Waiting for a fresh location from this device…');
-    navigator.geolocation.getCurrentPosition(async p=>{
-      const value={latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy,timestamp:p.timestamp};
-      setLocation(value);await request('/api/location',value);
-      setNotice(`Location received, accuracy ±${Math.round(value.accuracy)} m.`);
-    },e=>{setNotice('');setError(e.code===1?'Location permission was denied. Enable browser location access or connect Traccar in Connections.':'A fresh location could not be obtained. Check location services and try again.');},{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+    try{const value=await readBrowserLocation(navigator.geolocation);setLocation(value);await request('/api/location',value);setNotice(value.accuracy==null?'Location received.':`Location received, accuracy ±${Math.round(value.accuracy)} m.`);}
+    catch(e){setNotice('');setError(locationErrorMessage(e as {code?:string|number}));setNeedsManualLocation(true);}
   }
-  async function start(e:React.FormEvent){
-    e.preventDefault();if(!text.trim()||creatingMission.current)return;
+  async function createMissionAt(requestText:string,origin=location){
+    if(!requestText.trim()||creatingMission.current)return;
     creatingMission.current=true;selectMission(undefined);setMissionPending(true);setCompose(false);setPage('mission');setNotice('');
-    const result=await request('/api/missions',{text:text.trim(),...(workflowId?{workflowId}:{}),mode:'live',...(deadline?{deadlineMinutes:Number(deadline)}:{}),...(location?{origin:location}:{})});
+    const result=await request('/api/missions',{text:requestText.trim(),...(workflowId?{workflowId}:{}),mode:'live',...(deadline?{deadlineMinutes:Number(deadline)}:{}),...(origin?{origin}:{})});
     if(result?.mission?.id){selectMission(result.mission.id);setMissionPending(false);}
     else{setMissionPending(false);setCompose(true);}
     creatingMission.current=false;
+  }
+  async function start(e:React.FormEvent){
+    e.preventDefault();if(!text.trim()||creatingMission.current)return;
+    const requestText=text.trim();
+    if(locationRequiredForRequest(requestText)&&(!location||isNearbyPlaceRequest(requestText)&&location.evidenceKind!=='user-provided')){
+      setBusy('location');
+      setNotice('Allow location access to search nearby places. If permission is denied, enter a city below.');
+      try{
+        const value=await readBrowserLocation(navigator.geolocation);
+        setLocation(value);setBusy('');
+        const saved=await request('/api/location',value);
+        if(!saved){setNeedsManualLocation(true);setNotice('');return;}
+        setNeedsManualLocation(false);
+        await createMissionAt(requestText,value);return;
+      }catch(error){setBusy('');setNotice('');setError(locationErrorMessage(error as {code?:string|number}));setNeedsManualLocation(true);return;}
+      finally{setBusy(current=>current==='location'?'':current);}
+    }
+    await createMissionAt(requestText,location);
+  }
+  async function useManualLocation(placeId?:string){
+    if(!manualLocationQuery.trim())return;
+    const result=await request('/api/location/manual',{query:manualLocationQuery.trim(),...(placeId?{placeId}:{})});
+    if(!result)return;
+    const point=result.location as Location|null|undefined;
+    if(point){setLocation(point);setNeedsManualLocation(false);setManualLocationCandidates([]);await createMissionAt(text,point);return;}
+    setManualLocationCandidates(Array.isArray(result.candidates)?result.candidates as {id:string;label:string;address:string}[]:[]);
+    if(Array.isArray(result.candidates)&&result.candidates.length)setNotice(String(result.message||'Select the matching location.'));
+    if(!Array.isArray(result.candidates)||!result.candidates.length)setError(String(result.message||'No matching location was found. Try a more specific city or address.'));
   }
   function listen(){
     const Recognition=(window as any).SpeechRecognition||(window as any).webkitSpeechRecognition;
@@ -153,7 +222,7 @@ export default function App(){
     <WorkflowPicker value={workflowId} onChange={setWorkflowId} onManage={()=>setPage('workflows')}/>
     <label htmlFor="request">What would you like MOVA to do?</label>
     <div className="request-entry"><textarea id="request" name="request" autoComplete="off" value={text} onChange={e=>setText(e.target.value)} placeholder="Investigate this pull request, trace a rejected feature request, or prepare a source-backed response…" required maxLength={2000} rows={3}/><button type="button" className="icon-button" onClick={listen} title="Dictate your request" aria-label="Dictate your request"><Mic size={20}/></button></div>
-    <div className="request-options"><button className="primary" disabled={!!busy||!text.trim()} type="submit">{busy?<LoaderCircle size={17} className="spin"/>:<ArrowRight size={17}/>}Start investigation</button></div>
+    {needsManualLocation&&<div className="location-fallback"><MapPin size={18}/><div><strong>Enter a starting location</strong><p>Use a city, address, or landmark. MOVA will search places near that point.</p><div className="manual-location-entry"><input aria-label="City, address, or landmark" value={manualLocationQuery} onChange={e=>setManualLocationQuery(e.target.value)} placeholder="e.g. Koramangala, Bengaluru"/><button className="secondary" type="button" disabled={!!busy||!manualLocationQuery.trim()} onClick={()=>void useManualLocation()}>Use this location</button></div>{manualLocationCandidates.length>0&&<div className="manual-location-candidates" aria-label="Location matches">{manualLocationCandidates.map(candidate=><button type="button" className="secondary" key={candidate.id} onClick={()=>void useManualLocation(candidate.id)}><strong>{candidate.label}</strong>{candidate.address&&<small>{candidate.address}</small>}</button>)}</div>}</div></div>}{location&&<p className="quiet location-confirmation">Search location: {location.label||'current location'}{location.evidenceKind==='user-provided'?' (entered manually)':' (browser location)'}</p>}<div className="request-options"><button className="primary" disabled={!!busy||!text.trim()} type="submit">{busy?<LoaderCircle size={17} className="spin"/>:<ArrowRight size={17}/>}Start investigation</button></div>
     <div className="request-examples" aria-label="Request ideas"><button type="button" onClick={()=>setText('Inspect the public GitHub issues and recent approved community messages for this feature request. Determine whether it was previously rejected, explain why with sources, and propose a concise reply for my approval.')}>Trace a rejected idea</button><button type="button" onClick={()=>setText('Inspect this public pull request and related issues for duplicate work or a conflicting earlier decision. Produce evidence and propose a GitHub comment only if the conflict is clear.')}>Review a pull request</button><button type="button" onClick={()=>setText('Research an emerging issue across connected sources and save a source-linked decision brief with the next owner and the path of evidence.')}>Investigate connected context</button></div><p className="quiet">MOVA reads connected evidence, follows graph relationships, and asks before it posts or comments.</p>
   </form>;
   return <div className={`mova-app${sidebarCollapsed?' sidebar-collapsed':''}`}>
@@ -163,6 +232,7 @@ export default function App(){
     </nav><div className="nav-companion"><img className="sidebar-puppy" src="/images/mova-sleeping-transparent.png" alt="MOVA's sleeping puppy" width={94} height={94}/><p>Keep the outcome.<br/>Change the plan.</p></div><div className="server-status"><span className={connected?'status-dot online':'status-dot'}/><span className="server-status-label">{connected?'Agent connected':'Reconnecting…'}</span></div></aside>
     <main className="app-main" id="main-content" tabIndex={-1}>
       <header className="workspace-header"><div><span>MOVA workspace</span><strong>{page==='workflows'?'Workflows':page==='connections'?'Connections':page==='activity'?'Live execution':page==='comparison'?'FalkorDB graph impact':page==='history'?'Request history':'Your active investigation'}</strong></div><div className="header-actions"><span className="model-label">MOVA reasoning</span><button className="primary" disabled={missionPending} onClick={()=>{selectMission(undefined);setMissionPending(false);setCompose(true);setPage('mission');}}><Plus size={17}/>New request</button></div></header>
+      {page==='mission'&&bannerMission?.kind==='work'&&(bannerMission.state==='BLOCKED'||bannerProposals.length>0)?<section className="attention-request" aria-labelledby="global-attention-title"><CircleAlert size={24}/><div><p className="attention-kicker">{bannerMission.state==='BLOCKED'?'Attention required':'Approval required'}</p><h2 id="global-attention-title">{bannerMission.state==='BLOCKED'?bannerInput?.question||bannerMission.summary:proposalTitle(bannerProposals[0])}</h2><p><b>{bannerMission.state==='BLOCKED'?'Why MOVA stopped:':'MOVA prepared this action:'}</b> {bannerMission.state==='BLOCKED'?bannerInput?.reason||bannerMission.summary:'Review it before anything is sent.'}</p>{bannerMission.state==='BLOCKED'&&bannerInput?.options.length?<div className="attention-options">{bannerInput.options.map(option=><button key={option} className="secondary" disabled={!!busy} onClick={()=>{setInputText(option);setNeedsInput(true);}}>{option}</button>)}</div>:null}</div><button className="primary" disabled={!!busy} onClick={()=>bannerMission.state==='BLOCKED'?setNeedsInput(true):(shownProposals.current.add(bannerProposals[0].id),setSelectedProposal(bannerProposals[0]))}>{bannerMission.state==='BLOCKED'?'Answer MOVA':'Review action'}<ArrowRight size={16}/></button></section>:null}
       {error&&<div className="feedback error" role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={()=>setError('')}><X size={17}/></button></div>}
       {notice&&<div className="feedback notice" role="status"><span>{notice}</span><button aria-label="Dismiss notice" onClick={()=>setNotice('')}><X size={17}/></button></div>}
       {page==='workflows'?<Workflows onUse={useWorkflow}/>:page==='connections'?<Connections/>:page==='history'?<section className="history-page"><h1>Request history</h1><p>Real requests and their last recorded outcome.</p>{data.missions.length?data.missions.map(m=><article key={m.id}><strong>{m.title}</strong><span>{readable(m.state)}</span><button className="secondary" disabled={!!busy} onClick={async()=>{if(await request(`/api/missions/${m.id}/select`,{})){selectMission(m.id);setMissionPending(false);setCompose(false);setPage('mission');}}}>Open request<ArrowRight size={16}/></button></article>):<p>No requests yet.</p>}</section>:page==='activity'?mission?<ExecutionConsole mission={mission}/>:<section className="empty-workspace"><h1>No investigation is running</h1><p>Start an investigation to see MOVA’s decisions, tool calls, graph paths, and verification here.</p><button className="primary" onClick={()=>setPage('mission')}>Start investigation<ArrowRight size={17}/></button></section>:page==='comparison'?mission?<FalkorComparison mission={mission}/>:<section className="empty-workspace"><h1>No active mission to compare</h1><p>Start an investigation to inspect its live FalkorDB graph and counterfactual linear execution.</p><button className="primary" onClick={()=>setPage('mission')}>Start investigation<ArrowRight size={17}/></button></section>:<>
@@ -172,7 +242,6 @@ export default function App(){
         {!mission?<section className="setup-empty"><Plug size={24}/><div><h2>Start with the right connections</h2><p>Connect web, GitHub, Slack, Discord, calendar, and weather. MOVA will show what it needs before it acts.</p></div><button className="secondary" onClick={()=>setPage('connections')}>Check connections<ChevronRight size={17}/></button></section>:<>
           <section className="outcome-heading"><div><h1>{missionHeading(mission)}</h1><p>{mission.successCriteria}</p></div><span className={`state-badge state-${mission.state.toLowerCase()}`}>{mission.state==='RESOLVED'?<CheckCircle2 size={16}/>:<Activity size={16}/>} {readable(mission.state)}</span></section>
           <section className="agent-update" aria-live="polite"><Avatar state={mission.agentStatus} size={84}/><div><strong>{activeStates.includes(mission.state)?'MOVA is working':missionNeedsAttention?mission.inputRequest?'MOVA needs your input':'Investigation needs attention':mission.state==='RESOLVED'?'Result verified':'MOVA’s latest update'}</strong><p>{mission.summary}</p></div><button className="icon-button" onClick={speak} disabled={voice} title="Read update aloud" aria-label="Read update aloud">{voice?<LoaderCircle size={19} className="spin"/>:<Volume2 size={19}/>}</button></section>
-          {work&&mission.state==='BLOCKED'&&mission.inputRequest?<section className="attention-request" aria-labelledby="attention-title"><CircleAlert size={24}/><div><p className="attention-kicker">Attention required</p><h2 id="attention-title">{mission.inputRequest.question}</h2><p><b>Why MOVA stopped:</b> {mission.inputRequest.reason||mission.summary}</p>{mission.inputRequest.options.length?<div className="attention-options">{mission.inputRequest.options.map(option=><button key={option} className="secondary" disabled={!!busy} onClick={()=>{setInputText(option);setNeedsInput(true);}}>{option}</button>)}</div>:null}</div><button className="primary" disabled={!!busy} onClick={()=>setNeedsInput(true)}>Answer MOVA<ArrowRight size={16}/></button></section>:null}
           <Execution mission={mission}/>
           {travel&&<div className="journey-context"><span><MapPin size={16}/>{mission.origin?.label||mission.origin?.name||'Waiting for your position'}</span><ArrowRight size={15}/><span>{mission.destination?.label||mission.destination?.name||'Finding destination'}</span><span className="deadline"><Clock3 size={16}/>Arrive before {at(new Date(new Date(mission.deadline).getTime()-Number(mission.constraints.bufferMinutes||0)*60000).toISOString())}</span></div>}
           <div className={`outcome-grid ${travel?'':work?'work-outcome':'read-outcome'}`}>
@@ -191,7 +260,8 @@ export default function App(){
       <footer className="workspace-footer"><Database size={14}/>Connected evidence in FalkorDB<span>Source → decision → action → verification</span></footer>
     </main>
     <dialog ref={dialog} className="evidence-dialog" onCancel={()=>{setInspected(null);setExpanded(false);}}><button className="dialog-close icon-button" aria-label="Close details" onClick={()=>{setInspected(null);setExpanded(false);}}><X size={21}/></button>{inspected?<Inspector item={inspected}/>:expanded&&mission?<><h2>Live FalkorDB connected-data graph</h2><p>These are persisted nodes and exact relationships from this mission. Select a node or relation to inspect its evidence.</p><Bubble mission={mission} selectedPlan={selected||mission.selectedPlanId} onInspect={setInspected} expanded/></>:null}</dialog>
-    <dialog ref={inputDialog} className="agent-input-dialog" onCancel={()=>setNeedsInput(false)}>{mission&&<><button className="dialog-close icon-button" aria-label="Close MOVA input request" onClick={()=>setNeedsInput(false)}><X size={19}/></button><div className="action-agent-message"><Avatar state="thinking" size={46}/><div><strong>MOVA asks</strong><p>{inputPrompt.question}</p></div></div><h2>Give MOVA the missing decision</h2>{inputPrompt.reason&&<p className="input-blocker"><b>Blocked because:</b> {inputPrompt.reason}</p>}{inputPrompt.options.length>0&&<div className="input-suggestions">{inputPrompt.options.map(option=><button key={option} type="button" onClick={()=>setInputText(option)}>{option}</button>)}</div>}<form onSubmit={async event=>{event.preventDefault();if(!inputText.trim()||!mission)return;const answer=inputText.trim();setInputText('');setNeedsInput(false);await request(`/api/missions/${mission.id}/context`,{text:answer});}}><label htmlFor="agent-input">Your instruction or missing context</label><textarea id="agent-input" name="agent-input" autoComplete="off" value={inputText} onChange={event=>setInputText(event.target.value)} maxLength={2000} placeholder={inputPrompt.placeholder||inputPrompt.question} required/><button className="primary" disabled={!!busy||!inputText.trim()}>Continue investigation<ArrowRight size={16}/></button></form></>}</dialog>
+    <dialog ref={inputDialog} className="agent-input-dialog" onCancel={()=>setNeedsInput(false)}>{popupMission&&<><button className="dialog-close icon-button" aria-label="Close MOVA input request" onClick={()=>setNeedsInput(false)}><X size={19}/></button><div className="action-agent-message"><Avatar state="thinking" size={46}/><div><strong>MOVA asks</strong><p>{inputPrompt.question}</p></div></div><h2>Give MOVA the missing decision</h2>{inputPrompt.reason&&<p className="input-blocker"><b>Blocked because:</b> {inputPrompt.reason}</p>}{inputPrompt.options.length>0&&<div className="input-suggestions">{inputPrompt.options.map(option=><button key={option} type="button" onClick={()=>setInputText(option)}>{option}</button>)}</div>}<form onSubmit={async event=>{event.preventDefault();if(!inputText.trim()||!popupMission)return;const answer=inputText.trim();setInputText('');setNeedsInput(false);await request(`/api/missions/${popupMission.id}/context`,{text:answer});}}><label htmlFor="agent-input">Your instruction or missing context</label><textarea id="agent-input" name="agent-input" autoComplete="off" value={inputText} onChange={event=>setInputText(event.target.value)} maxLength={2000} placeholder={inputPrompt.placeholder||inputPrompt.question} required/><button className="primary" disabled={!!busy||!inputText.trim()}>Continue investigation<ArrowRight size={16}/></button></form></>}</dialog>
+    <dialog ref={actionDialog} className="action-dialog" onCancel={()=>setSelectedProposal(undefined)}>{selectedProposal&&popupMission&&<><button className="dialog-close icon-button" aria-label="Close action review" onClick={()=>setSelectedProposal(undefined)}><X size={19}/></button><div className="action-agent-message"><Avatar state="thinking" size={46}/><div><strong>MOVA needs your decision</strong><p>This action follows the connected evidence in the current mission. Nothing has been sent.</p></div></div><h3>{proposalTitle(selectedProposal)}</h3><pre>{proposalBody(selectedProposal)}</pre><div className="action-dialog-buttons"><button className="secondary" disabled={!!busy} onClick={async()=>{const result=await request(`/api/missions/${popupMission.id}/proposals/${selectedProposal.id}`,{revision:popupMission.revision,outcome:'reject'});if(result)setSelectedProposal(undefined);}}>Reject</button><button className="primary" disabled={!!busy} onClick={async()=>{const result=await request(`/api/missions/${popupMission.id}/proposals/${selectedProposal.id}`,{revision:popupMission.revision,outcome:'approve'});if(result)setSelectedProposal(undefined);}}><ShieldCheck size={16}/>Approve action</button></div></>}</dialog>
   </div>;
 }
 function Execution({mission,pending=false}:{mission?:Mission;pending?:boolean}){
@@ -222,6 +292,10 @@ function Inspector({item}:{item:GraphNode|GraphEdge}){
 }
 function Result({mission}:{mission:Mission}){
   const result=mission.result;
-  const heading=result?(mission.kind==='weather'?'Weather result':mission.kind==='calendar_read'?'Your calendar':'Request result'):['BLOCKED','FAILED_RETRYABLE','UNKNOWN'].includes(mission.state)?'Investigation needs attention':'Investigation in progress';
-  return <div className="read-result"><h2>{heading}</h2>{!result?<p>{mission.summary}</p>:<><p className="result-source">{String(result.source||'Connected tool')} · {result.observedAt?new Date(result.observedAt).toLocaleString():''}</p>{mission.kind==='calendar_read'?<div>{Array.isArray(result.events)&&result.events.length?result.events.map((e:any,i:number)=><article key={e.id||i}><strong>{e.summary||'Untitled event'}</strong><p>{e.start?.dateTime||e.start?.date||'Time unavailable'}{e.location?` · ${e.location}`:''}</p></article>):<p>No events returned for the requested period.</p>}</div>:mission.kind==='weather'&&result.current?<dl>{Object.entries(result.current).map(([key,value])=><div key={key}><dt>{key.replaceAll('_',' ')}</dt><dd>{String(value)} {result.current_units?.[key]||''}</dd></div>)}</dl>:<p>{mission.summary}</p>}<details><summary>Inspect source response</summary><pre>{JSON.stringify(result,null,2)}</pre></details></>}</div>;
+  const heading=result?(mission.kind==='weather'?'Weather result':mission.kind==='calendar_read'?'Your calendar':mission.kind==='nearby_places'?'Nearby places':'Request result'):['BLOCKED','FAILED_RETRYABLE','UNKNOWN'].includes(mission.state)?'Investigation needs attention':'Investigation in progress';
+  return <div className="read-result"><h2>{heading}</h2>{!result?<p>{mission.summary}</p>:<><p className="result-source">{String(result.source||'Connected tool')} · {result.observedAt?new Date(result.observedAt).toLocaleString():''}</p>{mission.kind==='nearby_places'?<NearbyResults result={result}/>:mission.kind==='calendar_read'?<div>{Array.isArray(result.events)&&result.events.length?result.events.map((e:any,i:number)=><article key={e.id||i}><strong>{e.summary||'Untitled event'}</strong><p>{e.start?.dateTime||e.start?.date||'Time unavailable'}{e.location?` · ${e.location}`:''}</p></article>):<p>No events returned for the requested period.</p>}</div>:mission.kind==='weather'&&result.current?<dl>{Object.entries(result.current).map(([key,value])=><div key={key}><dt>{key.replaceAll('_',' ')}</dt><dd>{String(value)} {result.current_units?.[key]||''}</dd></div>)}</dl>:<p>{mission.summary}</p>}<details><summary>Inspect source response</summary><pre>{JSON.stringify(result,null,2)}</pre></details></>}</div>;
+}
+function NearbyResults({result}:{result:Record<string,any>}){
+  const places=Array.isArray(result.places)?result.places:[];
+  return <div className="nearby-results"><p className="nearby-result-count">{places.length?`${places.length} places within ${(Number(result.radiusMeters||0)/1000).toFixed(1)} km, sorted by straight-line distance.`:`No matching places within ${(Number(result.radiusMeters||0)/1000).toFixed(1)} km. Try a wider radius or another category.`}</p>{result.center&&<NearbyMap center={result.center} places={places} radiusMeters={Number(result.radiusMeters||5000)}/>}<div className="nearby-place-list">{places.map((place:any)=><article key={place.id}><div className="nearby-place-title"><strong>{place.name}</strong><span>{place.distanceMeters<1000?`${Math.round(place.distanceMeters)} m`:`${(place.distanceMeters/1000).toFixed(1)} km`}</span></div>{place.address&&<p>{place.address}</p>}{place.categories?.length>0&&<small>{place.categories.join(' · ')}</small>}{place.rating!=null&&<small> · {place.rating}★{place.userRatingCount?` (${place.userRatingCount})`:''}</small>}{place.phone&&<p>{place.phone}</p>}{place.openingHours&&<small>{place.openingHours}</small>}{place.url&&<p><a href={place.url} target="_blank" rel="noreferrer">More information</a></p>}</article>)}</div></div>;
 }

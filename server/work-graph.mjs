@@ -64,10 +64,20 @@ function materialize(mission) {
     addEdge('decision:dispatch', `step:${step.id}`, 'GATES', 'FalkorDB dependency-ready query', 'calculated_estimate');
     for (const dependency of step.dependsOn) addEdge(`step:${step.id}`, `step:${dependency}`, 'DEPENDS_ON', 'Model-proposed dependency', 'inferred');
   });
-  const evidenceIds = new Set();
+  // Evidence from an earlier plan is retained in mission history as stale. It
+  // must not be attached to a new plan whose step IDs may have changed. Also
+  // collapse retry duplicates by stable evidence ID before making graph nodes.
+  const currentEvidence = new Map();
   for (const item of evidence) {
+    if (item.stale) continue;
+    if (!stepsById.has(item.stepId)) throw new Error(`Active evidence ${item.id} references unknown work step ${item.stepId}`);
     text(item.id, 'evidence identifier', 100);
-    if (evidenceIds.has(item.id) || !stepsById.has(item.stepId)) throw new Error('Duplicate evidence or unknown evidence step');
+    const previous = currentEvidence.get(item.id);
+    if (previous && previous.stepId !== item.stepId) throw new Error(`Evidence identifier ${item.id} is reused across work steps`);
+    if (!previous) currentEvidence.set(item.id, item);
+  }
+  const evidenceIds = new Set();
+  for (const item of currentEvidence.values()) {
     evidenceIds.add(item.id);
     const observedAt = date(item.observedAt, 'evidence timestamp');
     const source = text(item.source, 'evidence source', 1000);
@@ -78,6 +88,7 @@ function materialize(mission) {
   }
   const artifactIds = new Set();
   for (const artifact of artifacts) {
+    if (artifact.stale || !Array.isArray(artifact.sourceIds) || artifact.sourceIds.some(id => !evidenceIds.has(id))) continue;
     text(artifact.id, 'artifact identifier', 100);
     if (artifactIds.has(artifact.id) || !Array.isArray(artifact.sourceIds) || artifact.sourceIds.some(id => !evidenceIds.has(id))) throw new Error('Duplicate artifact or unknown artifact source');
     artifactIds.add(artifact.id);
@@ -88,6 +99,7 @@ function materialize(mission) {
   }
   const proposalIds = new Set();
   for (const proposal of proposals) {
+    if (!stepsById.has(proposal.stepId)) continue;
     text(proposal.id, 'proposal identifier', 100);
     if (proposalIds.has(proposal.id) || !stepsById.has(proposal.stepId)) throw new Error('Duplicate action proposal or unknown proposal step');
     proposalIds.add(proposal.id);

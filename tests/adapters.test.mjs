@@ -5,11 +5,38 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAdapters } from '../server/adapters.mjs';
 import { createProvider } from '../server/provider.mjs';
+import { distanceMeters, resolveManualPlace, validPoint } from '../server/geo.mjs';
+import { isNearbyPlaceRequest, leafletPoint, locationErrorMessage, locationRequiredForRequest, readBrowserLocation } from '../src/location.mjs';
 
 const reply = (data, status = 200) => new Response(JSON.stringify(data), { status });
 
 const tomtomInput = { origin: { latitude: 28, longitude: 77 }, destination: { latitude: 29, longitude: 78 }, deadline: new Date(Date.now() + 3600000).toISOString() };
 const tomtomRoute = (seconds = 1800, delay = 120) => ({ summary: { travelTimeInSeconds: seconds, trafficDelayInSeconds: delay, lengthInMeters: 24000, noTrafficTravelTimeInSeconds: 1680 }, legs: [{ points: [{ latitude: 28, longitude: 77 }, { latitude: 29, longitude: 78 }] }] });
+
+test('coordinate validation, haversine distance and Leaflet markers use consistent latitude-longitude order',()=>{
+  assert.deepEqual(validPoint({lat:0,lon:1}),{latitude:0,longitude:1});
+  assert.equal(validPoint({latitude:91,longitude:0}),null);
+  assert.ok(Math.abs(distanceMeters({latitude:0,longitude:0},{latitude:0,longitude:1})-111195)<5);
+  assert.deepEqual(leafletPoint({latitude:28.6,longitude:77.2}),[28.6,77.2]);
+});
+
+test('browser geolocation returns an actual fix and provides a manual fallback on denial or unavailability',async()=>{
+  const fix=await readBrowserLocation({getCurrentPosition(success){success({coords:{latitude:28.6,longitude:77.2,accuracy:18},timestamp:Date.now()});}});
+  assert.deepEqual([fix.latitude,fix.longitude,fix.accuracy],[28.6,77.2,18]);
+  await assert.rejects(readBrowserLocation({getCurrentPosition(_ok,fail){fail({code:1,message:'denied'});}}),error=>error.code==='PERMISSION_DENIED');
+  await assert.rejects(readBrowserLocation(undefined),error=>error.code==='UNAVAILABLE');
+  assert.match(locationErrorMessage({code:'PERMISSION_DENIED'}),/enter a city/i);
+  assert.equal(locationRequiredForRequest('Find nearby restaurants'),true);assert.equal(locationRequiredForRequest('Find restaurants near my current location'),true);
+  assert.equal(isNearbyPlaceRequest('Find nearby restaurants'),true);assert.equal(isNearbyPlaceRequest('Navigate to work'),false);
+  assert.equal(locationRequiredForRequest('Research restaurant trends in India'),false);
+});
+
+test('manual geocoding requires an explicit result selection when the place is unresolved or ambiguous',()=>{
+  const result={places:[{id:'a',location:{latitude:1,longitude:2}},{id:'b',location:{latitude:3,longitude:4}}]};
+  assert.equal(resolveManualPlace(result),null);assert.equal(resolveManualPlace(result,'b'),result.places[1]);
+  assert.equal(resolveManualPlace({places:[result.places[0]]}),result.places[0]);
+  assert.equal(resolveManualPlace({places:[result.places[0]],resolution:{status:'unresolved'}}),null);
+});
 
 test('TomTom requests current traffic and preserves alternatives, geometry and changing estimates', async () => {
   let seconds = 1800;
@@ -67,6 +94,28 @@ test('TomTom search returns real place identities and validates coordinates', as
   assert.equal(result.places[0].id, 'real-id');
   assert.deepEqual(result.places[0].location, { latitude: 28, longitude: 77 });
   assert.equal(adapters.getIntegrations().find(i => i.id === 'places').status, 'connected');
+});
+
+test('TomTom nearby search constrains results by the requested coordinates and radius',async()=>{
+  let url;
+  const adapters=createAdapters({env:{MAPS_PROVIDER:'tomtom',TOMTOM_API_KEY:'test'},fetchImpl:async input=>{url=new URL(input);return reply({results:[
+    {id:'near',poi:{name:'Nearby cafe',categories:['Cafe']},address:{freeformAddress:'1 Main Street'},position:{lat:28.601,lon:77.201}},
+    {id:'far',poi:{name:'Far cafe'},address:{freeformAddress:'Far Road'},position:{lat:29,lon:78}},
+    {id:'invalid',poi:{name:'Invalid'},position:{lat:91,lon:78}},
+  ]});}});
+  const result=await adapters.searchNearbyPlaces({query:'cafes',location:{latitude:28.6,longitude:77.2},radiusMeters:1000});
+  assert.match(url.pathname,/search\/2\/search\/cafes\.json/);
+  assert.equal(url.searchParams.get('lat'),'28.6');assert.equal(url.searchParams.get('lon'),'77.2');assert.equal(url.searchParams.get('radius'),'1000');assert.equal(url.searchParams.get('limit'),'20');
+  assert.deepEqual(result.places.map(place=>place.id),['near']);
+  assert.ok(result.places[0].distanceMeters>0&&result.places[0].distanceMeters<200);
+  assert.equal(result.places[0].name,'Nearby cafe');assert.equal(result.places[0].address,'1 Main Street');assert.ok(Date.parse(result.observedAt));
+});
+
+test('TomTom nearby search rejects missing credentials and invalid coordinate inputs clearly',async()=>{
+  const missing=createAdapters({env:{MAPS_PROVIDER:'tomtom'}});
+  await assert.rejects(missing.searchNearbyPlaces({query:'restaurants',location:{latitude:1,longitude:2}}),/TOMTOM_API_KEY/);
+  const configured=createAdapters({env:{MAPS_PROVIDER:'tomtom',TOMTOM_API_KEY:'test'}});
+  await assert.rejects(configured.searchNearbyPlaces({query:'restaurants',location:{latitude:91,longitude:2}}),/valid current or manually selected location/);
 });
 
 test('planner context keeps all candidates but excludes route geometry and bounds duplicated history', async () => {
