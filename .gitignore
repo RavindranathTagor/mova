@@ -1,9 +1,6 @@
 node_modules/
 dist/
-.env
-.env.local
-.env.*
-!.env.example
+
 .data/
 .research/
 output/
@@ -11,3 +8,20 @@ output/
 *.tsbuildinfo
 .playwright-cli/
 .vscode/
+
+# Test folders
+tests/
+test/
+__tests__/
+
+# Documentation
+docs/
+documentation/
+
+# Temporary system files
+.DS_Store
+Thumbs.db
+
+# Temporary files and logs
+*.tmp
+*.log
