@@ -335,7 +335,7 @@ The server binds to loopback by default and refuses non-loopback `HOST` values. 
 ### Install and start
 
 ```sh
-git clone <repository-url>
+git clone https://github.com/RavindranathTagor/mova.git
 cd mova
 cp .env.example .env
 npm install
