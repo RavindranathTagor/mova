@@ -1,10 +1,16 @@
 import { CheckCircle2, Database, GitBranch, ShieldCheck } from 'lucide-react';
+import {useState} from 'react';
+import Bubble from './Bubble';
+import WorkspaceMemoryGraph from './WorkspaceMemoryGraph';
+import type {GraphNode,GraphEdge} from '../types';
 import type { Mission } from '../types';
 import './falkor-comparison.css';
 
 const readable=(value:string)=>value.replaceAll('_',' ').replace(/\b\w/g,letter=>letter.toUpperCase());
 
 export default function FalkorComparison({mission}:{mission:Mission}){
+  const [showGraph,setShowGraph]=useState(false);
+  const [selected,setSelected]=useState<GraphNode|GraphEdge|null>(null);
   const steps=mission.work?.steps||[];
   const evidence=mission.work?.evidence||[];
   const dependencies=mission.graph.edges.filter(edge=>edge.label==='DEPENDS_ON');
@@ -24,6 +30,11 @@ export default function FalkorComparison({mission}:{mission:Mission}){
       <Metric value={graphQueries.length} label="Cypher traversals"/>
       <Metric value={`${completed}/${steps.length||0}`} label="completed tool steps"/>
     </section>
+    <section aria-label="Connected data explorer">
+      <button className="secondary" aria-expanded={showGraph} onClick={()=>setShowGraph(value=>!value)}><Database size={16}/>{showGraph?'Hide connected data':'Explore connected data'}</button>
+      {showGraph&&<><Bubble mission={mission} onInspect={setSelected} expanded/>{selected&&<section aria-label="Selected graph record"><h3>{selected.label}</h3><button className="text-button" onClick={()=>setSelected(null)}>Close record</button><pre style={{overflow:'auto',maxHeight:300}}>{JSON.stringify(selected,null,2)}</pre></section>}</>}
+    </section>
+    <WorkspaceMemoryGraph mission={mission}/>
     <section className="comparison-columns">
       <article className="comparison-column with-graph"><header><Database size={20}/><div><h2>With FalkorDB</h2><p>Evidence-Constrained Dispatch</p></div></header><ul>
         <li><CheckCircle2 size={16}/><span>{gates.length} active graph gate{gates.length===1?'':'s'} release only dependency-ready tools.</span></li>

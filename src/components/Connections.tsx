@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Check, ExternalLink, KeyRound, Plug, RefreshCw, Settings2 } from 'lucide-react';
+import { Check, ExternalLink, KeyRound, RefreshCw, Settings2 } from 'lucide-react';
 import './connections.css';
+import ResourceEditor from './ResourceEditor';
 
 type Connector = {
   id: string; name: string; purpose: string; configured: boolean; unsupported?: boolean; comingSoon?: boolean;
@@ -50,7 +51,7 @@ export function Connections() {
   const coreIds=new Set(['web','github','slack','discord','calendar','weather','graph']);
   const upcoming=items.filter(item=>item.comingSoon);
   return <section className="mova-connections" aria-label="Connections">
-    <header className="connections-intro"><div><span className="connections-eyebrow">YOUR SERVICES</span><h1>Connections</h1><p>Check what MOVA can use. Each check reports a real response and leaves your missions unchanged.</p></div><Plug size={25} aria-hidden="true" /></header>
+    <header className="connections-intro"><div><span className="connections-eyebrow">YOUR SERVICES</span><h1>Connections</h1><p>Check what MOVA can use. Each check reports a real response and leaves your missions unchanged.</p></div></header>
     {error && <p className="connections-error" role="alert">{error}</p>}
     {!items.length && !error && <p role="status">Loading connections…</p>}
     <div className="connections-grid">{items.filter(item=>coreIds.has(item.id)).map(item => {
@@ -64,6 +65,7 @@ export function Connections() {
         <p className="connection-detail" aria-live="polite">{checking ? 'Checking service access…' : expired ? 'Previous check expired. Check again for current access.' : item.detail}</p>
         <div className="connection-time">{item.checkedAt ? <>Checked {time(item.checkedAt)}{item.lastSuccessAt && item.lastSuccessAt !== item.checkedAt ? ` · Last success ${time(item.lastSuccessAt)}` : ''}</> : 'No check in this server session'}</div>
         <div className="connection-actions"><button type="button" disabled={checking || item.unsupported} onClick={() => void check(item.id)} title={item.checkDescription}><RefreshCw size={14} className={checking ? 'connection-spinning' : ''} aria-hidden="true" />{checking ? 'Checking…' : 'Check connection'}</button>{item.action && <a href={item.action.url} className="connection-oauth">{item.action.label}<ExternalLink size={13} aria-hidden="true" /></a>}</div>
+        {['discord','github','slack'].includes(item.id)&&<ResourceEditor service={item.id as 'discord'|'github'|'slack'}/>}
         {item.retryAfterSeconds && <p className="connection-limit" role="status">Showing the recent result. A new check is available after {item.retryAfterSeconds} seconds.</p>}
         <details className="connection-setup"><summary title="Show setup steps, required permissions, and official setup links"><Settings2 size={14} aria-hidden="true" />Setup & troubleshooting</summary><p>{item.checkDescription}</p><ol>{item.steps.map(step => <li key={step}>{step}</li>)}</ol><p className="connection-env-label">Connection values</p><div className="connection-keys">{item.keys.map(key => <code key={key}>{key}</code>)}</div>{needsValues&&item.keys.length>0&&<form className="connection-configure" onSubmit={event=>{event.preventDefault();void configure(item);}}><p><KeyRound size={14}/>{item.id==='github'?'Add an allowlisted token for approved pull-request comments.':'Paste the required values to configure this running local session.'}</p>{item.keys.map(key=><label key={key}>{key}<input value={drafts[item.id]?.[key]||''} onChange={event=>setDrafts(current=>({...current,[item.id]:{...(current[item.id]||{}),[key]:event.target.value}}))} type={/TOKEN|SECRET|KEY/.test(key)?'password':'text'} autoComplete="off" required/></label>)}<button type="submit" disabled={checking}>Save connection values</button></form>}<p className="connection-secret-note">Values stay in the current local server process. Put approved values in the server’s .env file to keep them after restart. Keys are never shown after submission.</p><nav aria-label={`${item.name} setup links`}>{item.links.map(link => <a href={link.url} key={link.url} target="_blank" rel="noopener noreferrer">{link.label}<ExternalLink size={12} aria-hidden="true" /></a>)}</nav></details>
       </article>;

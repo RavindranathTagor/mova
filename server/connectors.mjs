@@ -53,7 +53,12 @@ export function createConnectors({ env = process.env, adapters, provider, tracca
   };
   async function probe(id) {
     if(id==='web'){const result=await workTools.call('web_search',{query:'FalkorDB official documentation'});if(!result.results?.length)throw new Error('Search returned no results');return `Search returned ${result.results.length} real source links. Snippets are not independently verified claims.`;}
-    if(id==='github'){await workTools.call('read_github_repository',{repository:'FalkorDB/FalkorDB'});return 'Public GitHub repository read succeeded.';}
+    if(id==='github'){
+      const repositories=String(env.GITHUB_ALLOWED_REPOSITORIES||'').split(',').map(v=>v.trim()).filter(Boolean);
+      if(!repositories.length){await workTools.call('read_github_repository',{repository:'FalkorDB/FalkorDB'});return 'Public GitHub access works. Select repositories to enable workspace context.';}
+      for(const repository of repositories)await workTools.call('read_github_repository',{repository});
+      return `${repositories.length} selected repositories are readable. Issue write access requires an approved action to verify.`;
+    }
     if(id==='slack'){const channelId=String(env.SLACK_ALLOWED_CHANNEL_IDS||'').split(',').map(value=>value.trim()).find(Boolean);if(!channelId)throw new Error('No Slack channel is allowlisted');const result=await workTools.call('read_slack_channel',{channelId});return `Slack returned ${result.results?.length||0} recent messages from an allowlisted channel.`;}
     if(id==='discord'){const channelId=String(env.DISCORD_ALLOWED_CHANNEL_IDS||'').split(',').map(value=>value.trim()).find(Boolean);if(!channelId)throw new Error('No Discord channel is allowlisted');const result=await workTools.call('read_discord_channel',{channelId});return `Discord returned ${result.results?.length||0} recent messages from an allowlisted channel.`;}
     if(id==='artifacts'){await workTools.call('list_artifacts',{});return 'Local artifact storage is readable. No artifact was written by this check.';}

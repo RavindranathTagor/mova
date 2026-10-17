@@ -1,8 +1,9 @@
 ﻿import {createHash} from 'node:crypto';
 import {createToolSession} from './tool-session.mjs';
+import {toolService} from './workflows.mjs';
 
-const allowed = new Set(['web_search','read_web_page','read_github_repository','read_github_commits','read_github_issues','read_slack_channel','read_discord_channel','analyze_falkordb_impact','propose_github_pr_comment','propose_github_issue_comment','propose_slack_message','propose_discord_message','save_artifact','list_artifacts','get_calendar_events']);
-const proposalTools = new Set(['propose_github_pr_comment','propose_github_issue_comment','propose_slack_message','propose_discord_message']);
+const allowed = new Set(['web_search','read_web_page','read_github_repository','read_github_repository_tree','read_github_repository_snapshot','analyze_github_blast_radius','read_github_code','read_github_commits','read_github_issues','read_slack_channel','read_discord_channel','analyze_falkordb_impact','propose_github_pr_comment','propose_github_issue_comment','propose_github_issue','propose_github_commit','propose_slack_message','propose_discord_message','save_artifact','list_artifacts','get_calendar_events']);
+const proposalTools = new Set(['propose_github_pr_comment','propose_github_issue_comment','propose_github_issue','propose_github_commit','propose_slack_message','propose_discord_message']);
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 export async function approveWorkProposal({mission,proposalId,revision,reject=false,execute}) {
@@ -21,11 +22,11 @@ export async function approveWorkProposal({mission,proposalId,revision,reject=fa
 
 export function validateWorkPlan(plan, tools) {
   if(plan?.status==='blocked')throw new Error(String(plan.summary||'The requested outcome needs an unavailable capability.').slice(0,500));
-  if(plan?.status!=='ready'||!Array.isArray(plan.steps)||plan.steps.length<1||plan.steps.length>6)throw new Error('The model returned an invalid bounded work plan.');
+  if(plan?.status!=='ready'||!Array.isArray(plan.steps)||plan.steps.length<1||plan.steps.length>7)throw new Error('The model returned an invalid bounded work plan.');
   const names=new Set(tools.map(t=>t.name));const ids=new Set();
   for(const step of plan.steps){
     if(typeof step.id!=='string'||!/^[a-zA-Z0-9_-]{1,40}$/.test(step.id)||ids.has(step.id))throw new Error('Work step IDs must be unique and bounded.');ids.add(step.id);
-    if(!allowed.has(step.tool)||!names.has(step.tool))throw new Error('The work plan requested an unavailable tool: '+step.tool);
+    if((!allowed.has(step.tool)&&step.tool!=='recall_agent_memory'&&!step.tool.startsWith('mcp_'))||!names.has(step.tool))throw new Error('The work plan requested an unavailable tool: '+step.tool);
     if(typeof step.title!=='string'||!step.title.trim()||step.title.length>160||!step.args||Array.isArray(step.args)||typeof step.args!=='object'||!Array.isArray(step.dependsOn))throw new Error('Invalid typed work step.');
   }
   const visit=(id,stack=new Set())=>{if(stack.has(id))throw new Error('Work dependencies contain a cycle.');const step=plan.steps.find(s=>s.id===id);if(!step)throw new Error('Work dependency is missing.');for(const dependency of step.dependsOn)visit(dependency,new Set([...stack,id]));};
@@ -39,8 +40,8 @@ export function validateWorkPlan(plan, tools) {
 
 function requireGraphImpact(plan,catalog){
   if(!catalog.some(tool=>tool.name==='analyze_falkordb_impact')||!Array.isArray(plan?.steps)||plan.steps.some(step=>step.tool==='analyze_falkordb_impact'))return plan;
-  const evidenceSteps=plan.steps.filter(step=>step.tool==='web_search'||step.tool.startsWith('read_'));
-  if(!evidenceSteps.length||plan.steps.length>=6)return plan;
+  const evidenceSteps=plan.steps.filter(step=>step.tool==='web_search'||step.tool==='recall_agent_memory'||step.tool.startsWith('read_')||step.tool.startsWith('mcp_'));
+  if(!evidenceSteps.length||plan.steps.length>=7)return plan;
   let id='graph_impact';let suffix=1;while(plan.steps.some(step=>step.id===id)){id=`graph_impact_${suffix++}`;}
   const impact={id,title:'Rank multi-hop evidence impact in FalkorDB',tool:'analyze_falkordb_impact',args:{},dependsOn:evidenceSteps.map(step=>step.id)};
   for(const step of plan.steps)if(proposalTools.has(step.tool)||step.tool==='save_artifact')step.dependsOn=[...new Set([...step.dependsOn,id])];
@@ -60,20 +61,22 @@ function sourceEvidence(output,step,revision){
   }));
 }
 
+
 export async function runWorkMission({mission,provider,workTools,workGraph,persist,transition,trace}){
   if(!workTools?.list||!workTools?.call||!workGraph?.sync||!workGraph?.ready||!workGraph?.snapshot)throw new Error('Connect the work tools and FalkorDB work graph before running this task.');
   if(!provider?.planWork||!provider?.synthesizeWork)throw new Error('The configured model does not support structured work planning.');
   const end=Date.now()+180000;
   const bounded=async operation=>{const remaining=end-Date.now();if(remaining<=0)throw new Error('The work-cycle time budget is exhausted. Resume to continue.');let timer;return Promise.race([operation,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('The work-cycle time budget is exhausted. Resume to continue.')),remaining);})]).finally(()=>clearTimeout(timer));};
   const graphImpactTool={name:'analyze_falkordb_impact',description:'Run a FalkorDB multi-hop impact ranking over this mission graph. Use after relevant reads to identify connected evidence paths and the highest-impact decision nodes.',inputSchema:{type:'object',properties:{},required:[],additionalProperties:false},effect:'read'};
-  const catalog=[...(await workTools.list()).filter(t=>allowed.has(t.name)),...(typeof workGraph.analyzeImpact==='function'?[graphImpactTool]:[])];
+  const catalog=[...(await workTools.list()).filter(t=>(allowed.has(t.name)||t.name.startsWith('mcp_'))&&(!mission.workflow||mission.workflow.tools.includes(t.name)&&mission.workflow.connectors.includes(toolService(t.name)))),...(typeof workGraph.analyzeImpact==='function'?[graphImpactTool]:[])];
+  if(Array.isArray(mission.previousContext))catalog.push({name:'recall_agent_memory',description:'Read persisted previous mission decisions and answers for the currently connected resources. Historical records are not proof of current external state.',inputSchema:{type:'object',properties:{},required:[],additionalProperties:false},effect:'read'});
   mission.work||={steps:[],evidence:[],artifacts:[],proposals:[]};
   const work=mission.work;
   work.proposals||=[];
   const sync=async()=>{await bounded(workGraph.sync(mission));mission.graph=await bounded(workGraph.snapshot(mission));await persist();};
   if(!work.steps.length){
     await transition(mission,'PLANNING',`${provider.name||'The model'} is planning a bounded sequence of connected tools.`);
-    const plan=await bounded(provider.planWork({text:mission.goal,tools:catalog,evidence:work.evidence}));
+    const plan=await bounded(provider.planWork({text:mission.goal,tools:catalog,evidence:work.evidence,operationalContext:mission.operationalContext||null,connectedResources:mission.connectedResources||{},previousContext:mission.previousContext||[],contextUpdates:mission.contextUpdates||[],workflow:mission.workflow||null}));
     if(plan?.status==='blocked'){
       const question=typeof plan.question==='string'&&plan.question.trim()?plan.question.trim().slice(0,500):String(plan.summary||'What information should MOVA use to continue?').slice(0,500);
       const options=Array.isArray(plan.options)?[...new Set(plan.options.filter(option=>typeof option==='string'&&option.trim()).map(option=>option.trim().slice(0,160)))].slice(0,3):[];
@@ -91,30 +94,50 @@ export async function runWorkMission({mission,provider,workTools,workGraph,persi
   const session=await createToolSession(catalog,async(name,args)=>{
     if(!activeStep||name!==activeStep.tool&&name!=='list_artifacts')throw new Error('Tool is not active in the graph-ready step.');
     if(name==='analyze_falkordb_impact')return workGraph.analyzeImpact(mission);
+    if(name==='recall_agent_memory')return {source:'FalkorDB persistent mission memory',observedAt:new Date().toISOString(),evidenceKind:'observed',results:mission.previousContext.length?mission.previousContext.map(item=>({id:item.id,title:'Previous mission: '+String(item.goal).slice(0,120),summary:JSON.stringify({goal:item.goal,answer:item.answer,state:item.state,recordedAt:item.updatedAt,sources:item.sources}),observedAt:item.updatedAt})): [{id:'no-memory',title:'Persistent memory checked',summary:'No previous missions were found for these connected resources.'}]};
+    if(mission.workflow){
+      const service=toolService(name),ids=mission.connectedResources?.[service]||[];
+      if(args.repository&&!ids.includes(args.repository))throw new Error('Repository is outside the selected workflow resources.');
+      if(args.channelId&&!ids.includes(args.channelId))throw new Error('Channel is outside the selected workflow resources.');
+    }
     return workTools.call(name,args,{missionId:mission.id,stepId:activeStep.id,idempotencyKey:`${mission.id}:${work.planRevision}:${activeStep.id}`});
   });
-  const synthesize=async()=>{
+  const synthesize=async(final=false)=>{
+    if(final)await transition(mission,'VERIFYING',`${provider.name||'The model'} is verifying the result against retrieved evidence.`);
     if(work.synthesis)return work.synthesis;
     const current=work.evidence.filter(e=>!e.stale);
     if(!current.length)throw new Error('No current source evidence was returned; an answer cannot be verified.');
-    await transition(mission,'PLANNING',`${provider.name||'The model'} is drafting the result from retrieved evidence.`);
+    if(!final)await transition(mission,'PLANNING',`${provider.name||'The model'} is drafting the result from retrieved evidence.`);
     const answer=await bounded(provider.synthesizeWork({text:mission.goal,evidence:current}));
     if(typeof answer.answer!=='string'||!answer.answer.trim()||answer.answer.length>6000||typeof answer.title!=='string'||!Array.isArray(answer.sourceIds)||!answer.sourceIds.length||answer.sourceIds.some(id=>!current.some(e=>e.id===id)))throw new Error('The model returned an answer without valid current evidence references.');
     work.synthesis={answer:answer.answer,title:answer.title.slice(0,160),sourceIds:[...new Set(answer.sourceIds)]};await persist();return work.synthesis;
   };
   const draftProposal=async step=>{
-    if(!provider.draftAction)throw new Error('The configured model cannot draft an evidence-backed external reply.');
+    if(step.tool==='propose_github_commit'?!provider.draftCodeChange:!provider.draftAction)throw new Error(`The configured model cannot draft an evidence-backed ${step.tool==='propose_github_commit'?'code change':'external reply'}.`);
     const evidence=work.evidence.filter(item=>!item.stale);
     const target=step.tool==='propose_slack_message'||step.tool==='propose_discord_message'
       ? {channelId:step.args?.channelId}
       : step.tool==='propose_github_pr_comment'
         ? {repository:step.args?.repository,pullNumber:step.args?.pullNumber}
-        : {repository:step.args?.repository,issueNumber:step.args?.issueNumber};
+        : step.tool==='propose_github_issue'
+          ? {repository:step.args?.repository}
+          : step.tool==='propose_github_commit'
+            ? {repository:step.args?.repository,branch:step.args?.branch}
+          : {repository:step.args?.repository,issueNumber:step.args?.issueNumber};
     if(Object.values(target).some(value=>value===undefined||value===null||value===''))throw new Error('The planned external reply is missing its destination. Add the channel, repository, or discussion number.');
-    await transition(mission,'PLANNING',`${provider.name||'The model'} is drafting a reply from current evidence for your review.`);
-    const draft=await bounded(provider.draftAction({text:mission.goal,action:step.tool,target,evidence}));
-    const key=step.tool==='propose_slack_message'||step.tool==='propose_discord_message'?'text':'body';
-    step.args={...target,[key]:draft.content};step.draftSourceIds=draft.sourceIds;
+    await transition(mission,'PLANNING',`${provider.name||'The model'} is drafting ${step.tool==='propose_github_commit'?'a bounded code change':'a reply'} from current evidence for your review.`);
+    const draft=step.tool==='propose_github_commit'
+      ? await bounded(provider.draftCodeChange({text:mission.goal,target,evidence}))
+      : await bounded(provider.draftAction({text:mission.goal,action:step.tool,target,evidence}));
+    if(step.tool==='propose_github_commit'){
+      if(typeof draft.message!=='string'||!draft.message.trim()||!Array.isArray(draft.files)||!draft.files.length)throw new Error('The model returned an invalid evidence-backed code change.');
+      step.args={...step.args,...target,message:draft.message,files:draft.files};
+    }else{
+      const key=step.tool==='propose_slack_message'||step.tool==='propose_discord_message'?'text':'body';
+      step.args={...step.args,...target,[key]:draft.content};
+    }
+    step.draftSourceIds=draft.sourceIds;
+    if(step.tool==='propose_github_issue'&&!step.args.title)step.args.title=mission.goal.replace(/\s+/g,' ').slice(0,120);
     trace(mission,'agent','Reply drafted from evidence',`Prepared a reviewable ${step.tool.replace(/^propose_/,'').replaceAll('_',' ')} proposal from ${draft.sourceIds.length} current source record${draft.sourceIds.length===1?'':'s'}.`,{source:'Model evidence-backed draft',evidenceIds:draft.sourceIds});
     await sync();
   };
@@ -162,7 +185,7 @@ export async function runWorkMission({mission,provider,workTools,workGraph,persi
       trace(mission,'tool',step.title,step.summary,{tool:step.tool,source:output.source||'Persisted artifact',status:'VERIFIED',...(output.query?{query:output.query,params:output.params}: {})});await sync();
     }
     if(work.steps.some(s=>s.status!=='completed'))throw new Error('The bounded work-step budget was reached. Resume to continue.');
-    const result=await synthesize();work.answer=result.answer;work.sourceIds=result.sourceIds;work.completedAt=new Date().toISOString();
+    const result=await synthesize(true);work.answer=result.answer;work.sourceIds=result.sourceIds;work.completedAt=new Date().toISOString();
     await sync();await transition(mission,'RESOLVED','The requested research or local deliverable is complete and backed by retrieved evidence.');
   }catch(error){if(activeStep?.status==='running'){activeStep.status='failed';activeStep.summary=error.message;await sync();}throw error;}
   finally{await session.close();}

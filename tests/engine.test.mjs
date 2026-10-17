@@ -16,7 +16,7 @@ async function fixture(t,options={}){
  let calls=0;
  const adapters={getIntegrations:()=>[],calculateRoutes:async()=>testRoutes(),openNavigation:async({plan,destination})=>{calls++;return {status:'UNVERIFIED',navigationTarget:{planId:plan.id,destination,mode:plan.mode},summary:'In-app guidance ready.'};},...options.adapters};
  const provider={configured:true,compileIntent:async()=>({kind:'travel',destinationQuery:'Airport',deadlineMinutes:90,summary:'Airport arrival'}),next:async({mission})=>({selectedPlanId:mission.plans.find(p=>p.feasible)?.id,summary:'Use the feasible graph route'}),...options.provider};
- const graph=options.graph||testGraph();const engine=createEngine({store,graph,adapters,provider,workTools:options.workTools,workGraph:options.workGraph});await engine.init();return {engine,store,graph,adapters,provider,calls:()=>calls};
+ const graph=options.graph||testGraph();const engine=createEngine({store,graph,adapters,provider,workTools:options.workTools,workGraph:options.workGraph,onChange:options.onChange});await engine.init();return {engine,store,graph,adapters,provider,calls:()=>calls};
 }
 test('live is the default and unsupported modes and arbitrary events are unavailable',async t=>{
  const f=await fixture(t);const s=await f.engine.createMission(input);assert.equal(s.mission.mode,'live');assert.equal(s.mission.state,'AWAITING_APPROVAL');assert.equal(f.engine.injectEvent,undefined);await assert.rejects(f.engine.createMission({...input,mode:'demo'}),/Only live/);
@@ -47,6 +47,30 @@ test('weather request completes from real adapter contract without a travel loca
  const output={source:'Weather test fixture',observedAt:new Date().toISOString(),current:{temperature_2m:27},evidenceKind:'observed'};
  const f=await fixture(t,{provider:{compileIntent:async()=>({kind:'weather',destinationQuery:'Delhi',summary:'Read current weather'})},adapters:{searchPlaces:async()=>({places:[{location:destination}]}),getWeather:async()=>output}});
  const s=await f.engine.createMission({text:'Weather in Delhi'});assert.equal(s.mission.state,'RESOLVED');assert.equal(s.mission.kind,'weather');assert.deepEqual(s.mission.result,output);assert.equal(f.calls(),0);assert.ok(s.mission.graph.edges.some(e=>e.label==='VERIFIED_BY'));
+});
+test('background mission creation returns its ID before investigation completes and streams real progress',async t=>{
+ let releaseIntent,releaseWeather,notifyIntentStarted,notifyWeatherStarted,notifyResolved;
+ const intentGate=new Promise(resolve=>{releaseIntent=resolve}),weatherGate=new Promise(resolve=>{releaseWeather=resolve});
+ const intentStarted=new Promise(resolve=>{notifyIntentStarted=resolve}),weatherStarted=new Promise(resolve=>{notifyWeatherStarted=resolve}),resolved=new Promise(resolve=>{notifyResolved=resolve});
+ const output={source:'Weather test fixture',observedAt:new Date().toISOString(),current:{temperature_2m:27},evidenceKind:'observed'};
+ const f=await fixture(t,{
+  onChange:state=>{if(state.mission?.state==='RESOLVED')notifyResolved(state);},
+  provider:{compileIntent:async()=>{notifyIntentStarted();return intentGate;}},
+  adapters:{searchPlaces:async()=>({places:[{location:destination}]}),getWeather:async()=>{notifyWeatherStarted();return weatherGate;}},
+ });
+ const initial=await f.engine.createMission({text:'What is the current weather in Pune?'},{background:true});
+ assert.ok(initial.mission.id);assert.equal(initial.mission.state,'MISSION_CREATED');
+ await intentStarted;
+ assert.equal(f.engine.getState().mission.state,'INVESTIGATING');
+ releaseIntent({kind:'weather',destinationQuery:'Pune',goal:'Get current weather information for Pune',summary:'Read the current weather'});
+ await weatherStarted;
+ assert.equal(f.engine.getState().mission.state,'EXECUTING');
+ assert.ok(f.engine.getState().mission.trace.some(trace=>trace.title==='Weather source read started'));
+ releaseWeather(output);
+ const final=await resolved;
+ assert.equal(final.mission.id,initial.mission.id);assert.equal(final.mission.state,'RESOLVED');
+ assert.equal(final.mission.title,'Get current weather information for Pune');assert.deepEqual(final.mission.result,output);
+ assert.deepEqual(final.mission.trace.filter(trace=>trace.kind==='state').map(trace=>trace.title).slice(-6),['INVESTIGATING','BUILDING CONTEXT','PLANNING','EXECUTING','VERIFYING','RESOLVED']);
 });
 test('calendar read uses authorized connector and unsupported actions are blocked',async t=>{
  const output={source:'Calendar test fixture',observedAt:new Date().toISOString(),events:[]};const f=await fixture(t,{provider:{compileIntent:async()=>({kind:'calendar_read',destinationQuery:'',summary:'Read calendar'})},adapters:{getCalendarEvents:async()=>output}});let s=await f.engine.createMission({text:'Read my upcoming meetings'});assert.equal(s.mission.state,'RESOLVED');assert.deepEqual(s.mission.result.events,[]);

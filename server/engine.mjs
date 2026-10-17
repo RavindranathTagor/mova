@@ -1,4 +1,5 @@
 import {approveWorkProposal,runWorkMission} from './work-engine.mjs';
+import {connectedResources} from './resource-registry.mjs';
 ﻿import { randomUUID, createHash } from 'node:crypto';
 
 const tools = [
@@ -52,7 +53,7 @@ function distanceToRoute(position, mission) {
   return closest;
 }
 
-export function createEngine({graph,store,adapters={},provider,workTools,workGraph,onChange=()=>{}}) {
+export function createEngine({graph,store,adapters={},provider,workTools,workGraph,operationsGraph=null,onChange=()=>{}}) {
   let state={version:1,currentId:null,missions:[]};
   let queue=Promise.resolve();
   let location=null;
@@ -124,7 +125,21 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
         trace(mission,'agent','Mission understood',intent.summary,{source:'Model intent extraction'});
         await persist();
       }
-      if(mission.kind==='work'){await runWorkMission({mission,provider,workTools,workGraph,persist,transition,trace});return;}
+      await transition(mission,'BUILDING_CONTEXT','Gathering the connected context needed for this investigation.');
+      if(mission.kind==='work'){
+        if(mission.operationalContext?.kind==='customer_incident'&&!mission.operationalContext.reportId)delete mission.operationalContext;
+        mission.connectedResources=connectedResources();
+        if(mission.workflow)mission.connectedResources=Object.fromEntries(Object.entries(mission.connectedResources).filter(([service])=>mission.workflow.connectors.includes(service)).map(([service,ids])=>[service,ids.filter(id=>!mission.workflow.resources?.[service]?.length||mission.workflow.resources[service].includes(id))]));
+        mission.previousContext=state.missions.filter(item=>item.id!==mission.id&&item.kind==='work').slice(-5).map(item=>({id:item.id,goal:item.goal.slice(0,1000),answer:item.work?.answer?.slice(0,1500),state:item.state}));
+        if(operationsGraph?.recallMissions){
+          const recalled=await operationsGraph.recallMissions({excludeId:mission.id,resources:mission.connectedResources});
+          mission.previousContext=recalled.memories;
+          trace(mission,'graph','Persistent memory recalled',`${recalled.memories.length} previous missions retrieved for the selected resources.`,{source:'FalkorDB',query:recalled.query,evidenceIds:recalled.memories.map(item=>item.id)});
+        }
+        try{await runWorkMission({mission,provider,workTools,workGraph,persist,transition,trace});}
+        finally{if(operationsGraph?.rememberMission)await operationsGraph.rememberMission(mission);}
+        return;
+      }
       if(mission.kind==='calendar_read'||mission.kind==='weather'){await performRead(mission,bounded);return;}
       if(!mission.destination){
         const places=await bounded(adapters.searchPlaces({query:mission.intent.destinationQuery}));
@@ -144,7 +159,6 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
         mission.needsRouteRefresh=false;
         trace(mission,'tool','Route source queried',`${mission.plans.length} route options returned.`,{tool:'calculate_routes',source:mission.plans[0]?.source||'Configured route adapter'});
       }
-      await transition(mission,'BUILDING_CONTEXT','Connecting your destination, deadline, routes and their dependencies.');
       await bounded(graph.seed(mission));
       if(mission.observations.length)await bounded(captureImpact(mission,mission.observations.at(-1)));
       const dependencies=await bounded(graph.findDependencies(mission));
@@ -238,18 +252,25 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
     }finally{cycleActive=false;if(toolSession)await toolSession.close();}
   }
   async function performRead(mission,bounded){
-    await transition(mission,'INVESTIGATING','Reading the authorized source for your request.');
     let output;
     if(mission.kind==='calendar_read'){
       if(!adapters.getCalendarEvents)throw new Error('Connect a calendar with read permission to answer this request.');
-      output=await bounded(adapters.getCalendarEvents({timeMin:stamp(),timeMax:mission.deadline,maxResults:10}));
     }else{
-      if(!adapters.getWeather)throw new Error('Connect a weather source to answer this request.');
       if(!mission.destination&&mission.intent.destinationQuery){const places=await bounded(adapters.searchPlaces({query:mission.intent.destinationQuery}));const place=resolvedPlace(places,'weather location');if(place?.location)mission.destination={...place.location,label:place.displayName?.text||mission.intent.destinationQuery,source:places.source};}
       const place=mission.destination||mission.origin;
       if(!place)throw new Error('Specify a weather location or share your current position.');
-      output=await bounded(adapters.getWeather(place));
     }
+    await transition(mission,'PLANNING','Selecting the authorized source for the requested information.');
+    if(mission.kind==='weather'&&!adapters.getWeather)throw new Error('Connect a weather source to answer this request.');
+    await transition(mission,'EXECUTING',mission.kind==='weather'?'Reading current weather from the connected source.':'Reading events from the authorized calendar.');
+    trace(mission,'tool',mission.kind==='weather'?'Weather source read started':'Calendar source read started','MOVA is requesting current information from the selected connected source.',{tool:mission.kind==='weather'?'get_weather':'get_calendar_events'});
+    await persist();
+    output=mission.kind==='calendar_read'
+      ?await bounded(adapters.getCalendarEvents({timeMin:stamp(),timeMax:mission.deadline,maxResults:10}))
+      :await bounded(adapters.getWeather(mission.destination||mission.origin));
+    await transition(mission,'VERIFYING','Checking the source response and its evidence before presenting a result.');
+    trace(mission,'tool',mission.kind==='weather'?'Weather source returned':'Calendar source returned','The connected source returned data for verification.',{tool:mission.kind==='weather'?'get_weather':'get_calendar_events',source:output?.source});
+    await persist();
     if(!output||!output.source||!output.observedAt)throw new Error('The connector did not return verifiable source evidence.');
     mission.result=output;
     const event={id:randomUUID(),type:mission.kind==='weather'?'weather':'calendar',at:Date.parse(output.observedAt),source:output.source,evidenceKind:output.evidenceKind||'observed',value:output};
@@ -272,7 +293,7 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
   }
   return {getState,
     hasMentionEvent(eventId){return (typeof eventId==='string'&&state.missions.some(mission=>mission.trigger?.eventId===eventId))||Boolean(state.archivedMissions?.some(mission=>mission.trigger?.eventId===eventId));},
-    updateWorkContext(id,text){return serialize(async()=>{const mission=find(id);if(mission.kind!=='work')throw errorWithStatus('Context updates require a work mission.');if(typeof text!=='string'||!text.trim()||text.length>2000)throw errorWithStatus('Provide a context update between 1 and 2000 characters.');mission.originalGoal||=mission.goal;mission.goal=`Latest instruction: ${text.trim()}\nOriginal objective: ${mission.originalGoal}`;mission.revision++;delete mission.inputRequest;mission.work||={steps:[],evidence:[],artifacts:[],proposals:[]};mission.work.evidence=mission.work.evidence.map(e=>({...e,stale:true}));mission.work.artifacts=mission.work.artifacts.map(a=>({...a,stale:true}));mission.work.proposals=(mission.work.proposals||[]).map(item=>item.status==='PENDING_APPROVAL'?{...item,status:'STALE',resolvedAt:stamp()}:item);mission.work.steps=[];delete mission.work.synthesis;delete mission.work.answer;delete mission.work.completedAt;await transition(mission,'REPLANNING','The updated context requires fresh evidence and a revised tool plan.');await investigate(mission);return getState();});},
+    updateWorkContext(id,text){return serialize(async()=>{const mission=find(id);if(mission.kind!=='work')throw errorWithStatus('Context updates require a work mission.');if(typeof text!=='string'||!text.trim()||text.length>2000)throw errorWithStatus('Provide a context update between 1 and 2000 characters.');mission.originalGoal||=mission.goal;mission.contextUpdates||=[];mission.contextUpdates.push({text:text.trim(),at:stamp()});mission.goal=`Original objective: ${mission.originalGoal}\nUpdates (oldest to newest):\n${mission.contextUpdates.slice(-8).map(item=>item.text).join('\n')}`;mission.revision++;delete mission.inputRequest;mission.work||={steps:[],evidence:[],artifacts:[],proposals:[]};mission.work.evidence=mission.work.evidence.map(e=>({...e,stale:true}));mission.work.artifacts=mission.work.artifacts.map(a=>({...a,stale:true}));mission.work.proposals=(mission.work.proposals||[]).map(item=>item.status==='PENDING_APPROVAL'?{...item,status:'STALE',resolvedAt:stamp()}:item);mission.work.steps=[];delete mission.work.synthesis;delete mission.work.answer;delete mission.work.completedAt;await transition(mission,'REPLANNING','The updated context requires fresh evidence and a revised tool plan.');await investigate(mission);return getState();});},
     resolveWorkProposal(id,proposalId,revision,outcome){return serialize(async()=>{
       const mission=find(id);if(mission.kind!=='work')throw errorWithStatus('Action proposals require a connected-data mission.',409);
       if(!['approve','reject'].includes(outcome))throw errorWithStatus('Choose approve or reject.',400);
@@ -282,14 +303,24 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
       const proposal=mission.work.proposals.find(item=>item.id===proposalId);
       const summary=outcome==='reject'?'You rejected the proposed external action. Nothing was sent.':result.status==='VERIFIED'?`Approved ${proposal.service} action completed and was confirmed by the connector.`:'The approved action did not return a confirmed result.';
       mission.receipts.push({id:randomUUID(),tool:`${proposal.service}_${proposal.operation}`,status:result.status,at:stamp(),summary,revision,verification:{proposalId,source:result.source||null,remoteId:result.remoteId||null,url:result.url||null}});
+      if(outcome==='approve'&&result.status==='VERIFIED'&&mission.operationalContext?.reportId&&operationsGraph){
+        if(proposal.operation==='create_issue'){
+          const issueNumber=Number(result.remoteId||0)||Number(String(result.url||'').match(/\/issues\/(\d+)/)?.[1]);
+          await operationsGraph.recordIssueReceipt({reportId:mission.operationalContext.reportId,repository:proposal.repository,issueNumber,url:result.url,idempotencyKey:`incident:${mission.operationalContext.reportId}:issue`});
+          for(const pending of mission.work.proposals.filter(item=>item.status==='PENDING_APPROVAL'&&item.service==='discord'&&item.operation==='post_channel_message')){
+            if(result.url&&!pending.text?.includes(result.url))pending.text=`${pending.text}\n\nTracked in GitHub: ${result.url}`;
+          }
+        }
+        if(proposal.service==='discord'&&proposal.operation==='post_channel_message')await operationsGraph.recordNotificationReceipt({reportId:mission.operationalContext.reportId,id:`incident:${mission.operationalContext.reportId}:discord`,url:result.url||`discord:${result.remoteId||''}`});
+      }
       trace(mission,outcome==='reject'?'decision':'action',outcome==='reject'?'Action proposal rejected':'Approved action completed',summary,{tool:`${proposal.service}_${proposal.operation}`,status:result.status,source:result.source});
       await workGraph.sync(mission);mission.graph=await workGraph.snapshot(mission);await persist();return getState();
     });},
     selectMission(id){return serialize(async()=>{find(id);await persist();return getState();});},
-    async init(){state=await store.load();state.missions||=[];state.archivedMissions||=[];const retired=state.missions.filter(m=>m.mode!=='live');state.archivedMissions.push(...retired);state.missions=state.missions.filter(m=>m.mode==='live');state.currentId=null;await graph.init();for(const mission of state.missions){mission.kind||=mission.intent?.kind||'travel';
+    async init(){state=await store.load();state.missions||=[];state.archivedMissions||=[];const savedCurrentId=state.currentId;const retired=state.missions.filter(m=>m.mode!=='live');state.archivedMissions.push(...retired);state.missions=state.missions.filter(m=>m.mode==='live');state.currentId=state.missions.some(m=>m.id===savedCurrentId)?savedCurrentId:null;await graph.init();for(const mission of state.missions){mission.kind||=mission.intent?.kind||'travel';
       if(mission.state==='EXECUTING'){mission.state=mission.kind==='work'?'BLOCKED':'UNKNOWN';mission.summary='An action was interrupted. Its effect must be reconciled before retrying.';for(const receipt of mission.receipts)if(receipt.status==='PENDING')receipt.status='UNKNOWN';}
     }await persist();return getState();},
-    createMission(input){return serialize(async()=>{
+    createMission(input,{background=false}={}){return serialize(async()=>{
       if(!input||typeof input.text!=='string'||!input.text.trim()||input.text.length>2000)throw errorWithStatus('Enter a mission between 1 and 2000 characters.');
       if(input.mode!=null&&input.mode!=='live')throw errorWithStatus('Only live missions are supported.');
       const minutes=Number(input.deadlineMinutes??90);
@@ -298,10 +329,17 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
       if(budget!=null&&(!Number.isFinite(budget)||budget<0))throw errorWithStatus('Budget must be a non-negative number.');
       const trigger=input.trigger&&typeof input.trigger==='object'?{service:String(input.trigger.service||'').slice(0,100),source:String(input.trigger.source||'').slice(0,300),channelId:input.trigger.channelId?String(input.trigger.channelId).slice(0,100):null,repository:input.trigger.repository?String(input.trigger.repository).slice(0,200):null,issueNumber:Number.isInteger(input.trigger.issueNumber)?input.trigger.issueNumber:null,eventId:String(input.trigger.eventId||'').slice(0,200),authorId:String(input.trigger.authorId||'').slice(0,200),content:String(input.trigger.content||'').slice(0,4000),observedAt:input.trigger.observedAt&&Number.isFinite(Date.parse(input.trigger.observedAt))?new Date(input.trigger.observedAt).toISOString():stamp()}:null;
       if(trigger&&(!trigger.service||!trigger.source||!trigger.eventId))throw errorWithStatus('Invalid connected mention event.',400);
-      const mission={id:randomUUID(),title:input.text.trim().slice(0,80),goal:input.text.trim(),state:'DETECTED',mode:'live',kind:'pending',revision:0,createdAt:stamp(),deadlineExplicit:input.deadlineMinutes!=null,deadline:new Date(Date.now()+minutes*60000).toISOString(),successCriteria:'Identify the requested outcome and verify it against a connected source.',summary:'Mission detected',agentStatus:'detected',selectedPlanId:null,plans:[],graph:{nodes:[],edges:[],backend:'unavailable'},trace:[],receipts:[],observations:[],constraints:{bufferMinutes:15,maxCost:budget},origin:input.origin||location,destination:input.destination||null,...(trigger?{trigger}:{})};
+      const suppliedContext=input.operationalContext&&typeof input.operationalContext==='object'?structuredClone(input.operationalContext):null;
+      const operationalContext=suppliedContext;
+      const incidentIntent=input.workflow||operationalContext?.channelId&&operationalContext?.repository?{kind:'work',goal:input.text.trim(),destinationQuery:'',summary:'Connected workflow selected.',successCriteria:'Complete the selected workflow using connected evidence.'}:null;
+      const mission={...(input.workflow?{workflow:structuredClone(input.workflow)}:{}),id:randomUUID(),title:input.text.trim().slice(0,80),goal:input.text.trim(),state:'DETECTED',mode:'live',kind:incidentIntent?'work':'pending',revision:0,createdAt:stamp(),deadlineExplicit:input.deadlineMinutes!=null,deadline:new Date(Date.now()+minutes*60000).toISOString(),successCriteria:incidentIntent?.successCriteria||'Identify the requested outcome and verify it against a connected source.',summary:'Mission detected',agentStatus:'detected',selectedPlanId:null,plans:[],graph:{nodes:[],edges:[],backend:'unavailable'},trace:[],receipts:[],observations:[],constraints:{bufferMinutes:15,maxCost:budget},origin:input.origin||location,destination:input.destination||null,...(incidentIntent?{intent:incidentIntent,operationalContext}:{}),...(trigger?{trigger}:{})};
       state.missions.push(mission);state.currentId=mission.id;
       trace(mission,'event','Mission created',mission.goal,{source:trigger?trigger.source:'User',evidenceKind:trigger?'observed':'user-provided'});
       await transition(mission,'MISSION_CREATED','Compiling the mission constraints and authorized sources.');
+      if(background){
+        setImmediate(()=>{void investigate(mission).catch(error=>console.error(`MOVA background investigation ${mission.id} failed:`,error));});
+        return getState();
+      }
       await investigate(mission);return getState();
     });},
     approve(id,revision){return serialize(async()=>{

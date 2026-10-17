@@ -1,4 +1,6 @@
 import express from 'express';
+import {createWorkflows} from './workflows.mjs';
+import {createResourceRegistry} from './resource-registry.mjs';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import { resolve, join } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -12,7 +14,11 @@ import { createConnectors } from './connectors.mjs';
 import { createWorkTools } from './work-tools.mjs';
 import { createWorkGraph } from './work-graph.mjs';
 import { createRemoteMcp } from './remote-mcp.mjs';
+import { createIncidentRouting } from './incident-routing.mjs';
+import { createOperationsGraph } from './operations-graph.mjs';
 
+const resources=createResourceRegistry({path:join(process.env.MOVA_DATA_DIR||'.data','resources.json')});
+await resources.init();
 const app=express();
 const port=Number(process.env.PORT||3001);
 const host=process.env.HOST||'127.0.0.1';
@@ -23,10 +29,15 @@ const provider=createProvider({env:process.env});
 const graph=createGraph({url:process.env.FALKORDB_URL||'redis://127.0.0.1:6380'});
 const traccar=createTraccar({env:process.env});
 const workGraph=createWorkGraph({url:process.env.FALKORDB_URL||'redis://127.0.0.1:6380'});
-const localWorkTools=createWorkTools({env:process.env,dataDir:join(process.env.MOVA_DATA_DIR||'.data','artifacts'),adapters});
+const operationsGraph=createOperationsGraph({url:process.env.FALKORDB_URL||'redis://127.0.0.1:6380'});
+const incidentRouting={resolve:event=>createIncidentRouting({env:process.env}).resolve(event)};
+const currentWorkTools=()=>createWorkTools({env:process.env,dataDir:join(process.env.MOVA_DATA_DIR||'.data','artifacts'),adapters,operationsGraph});
+const localWorkTools=Object.fromEntries(['list','call','executeProposal','listMentions','listCustomerReports'].map(name=>[name,(...args)=>currentWorkTools()[name](...args)]));
 const remoteMcp=createRemoteMcp({env:process.env});
 await remoteMcp.init();
 const workTools={list:()=>[...localWorkTools.list(),...remoteMcp.list()],call:(name,args,context)=>name.startsWith('mcp_')?remoteMcp.call(name,args):localWorkTools.call(name,args,context),executeProposal:proposal=>localWorkTools.executeProposal(proposal)};
+const workflows=createWorkflows({path:join(process.env.MOVA_DATA_DIR||'.data','workflows.json'),getTools:()=>workTools.list()});
+await workflows.init();
 const connectors=createConnectors({env:process.env,adapters,provider,traccar,workTools,remoteMcp});
 let trackingPosition=null;
 let trackingEnabled=true;
@@ -35,10 +46,12 @@ let trackingMonitoringError=null;
 let trackingRequest;
 const enrich=state=>({...state,integrations:[...state.integrations,traccar.status()],tracking:{enabled:trackingEnabled,configured:traccar.configured,position:trackingPosition,error:trackingError,monitoringError:trackingMonitoringError,serverUrl:process.env.TRACCAR_URL||'http://127.0.0.1:8082'}});
 const broadcast=state=>{const event=`event: state\ndata: ${JSON.stringify(enrich(state))}\n\n`;for(const response of listeners)response.write(event);};
-const engine=createEngine({graph,store:createStore({path:join(process.env.MOVA_DATA_DIR||'.data','missions.json')}),adapters,provider,workTools,workGraph,onChange:broadcast});
+const engine=createEngine({graph,store:createStore({path:join(process.env.MOVA_DATA_DIR||'.data','missions.json')}),adapters,provider,workTools,workGraph,operationsGraph,onChange:broadcast});
 await engine.init();
+await operationsGraph.init();
 let mentionPoll;
 const mentionSeen=new Set();
+const incidentSeen=new Set();
 const mentionPollSeconds=Math.max(20,Math.min(300,Number(process.env.MOVA_MENTION_POLL_SECONDS||45)||45));
 const mentionMaxAgeMs=Math.max(1,Math.min(60,Number(process.env.MOVA_MENTION_MAX_AGE_MINUTES||10)||10))*60000;
 async function pollMentions(){
@@ -58,9 +71,29 @@ async function pollMentions(){
   })();
   try{return await mentionPoll;}finally{mentionPoll=null;}
 }
+async function pollCustomerReports(){
+  const reports=await localWorkTools.listCustomerReports();
+  for(const report of reports.slice(-12)){
+    if(incidentSeen.has(report.eventId)||engine.hasMentionEvent(report.eventId))continue;
+    incidentSeen.add(report.eventId);
+    if(Date.now()-Date.parse(report.observedAt)>mentionMaxAgeMs)continue;
+    try{
+      const binding=incidentRouting.resolve(report);
+      const fingerprint=String(report.content).toLowerCase().replace(/#customer-issue\b/g,'').replace(/[^a-z0-9]+/g,' ').trim().split(' ').filter(word=>word.length>2).slice(0,12).sort().join('-')||report.id;
+      await operationsGraph.upsertReport({id:report.id,channelId:binding.channelId,repository:binding.repository,fingerprint,summary:report.content,observedAt:report.observedAt});
+      const related=await operationsGraph.findRelated({repository:binding.repository,fingerprint});
+      const existingIssueNumber=related.issueNumbers.length===1?related.issueNumbers[0]:null;
+      const text=`Customer report from Discord: ${report.content}`;
+      await engine.createMission({text,mode:'live',deadlineMinutes:90,trigger:report,operationalContext:{...binding,kind:'customer_incident',reportId:report.id,fingerprint,existingIssueNumber,relatedPaths:related.paths}},{background:true});broadcast(engine.getState());
+    }catch(error){console.warn(`MOVA could not start customer incident workflow: ${String(error.message||'unknown error').slice(0,160)}`);}
+  }
+}
 const mentionTimer=setInterval(()=>void pollMentions().catch(()=>{}),mentionPollSeconds*1000);
 mentionTimer.unref();
 void pollMentions().catch(()=>{});
+const incidentTimer=setInterval(()=>void pollCustomerReports().catch(()=>{}),mentionPollSeconds*1000);
+incidentTimer.unref();
+void pollCustomerReports().catch(()=>{});
 async function refreshTracking(){
   if(trackingRequest)return trackingRequest;
   if(!traccar.configured||!trackingEnabled)return enrich(engine.getState());
@@ -105,6 +138,9 @@ app.use((req,res,next)=>{
 });
 const route=fn=>async(req,res,next)=>{try{await fn(req,res);}catch(e){next(e);}};
 app.get('/api/state',(_req,res)=>res.json(enrich(engine.getState())));
+app.get('/api/resources',(_req,res)=>res.json({resources:resources.list()}));
+app.get('/api/memory/graph',route(async(_req,res)=>res.json(await operationsGraph.snapshot())));
+app.put('/api/resources/:service',route(async(req,res)=>res.json({resources:await resources.update(req.params.service,req.body.values)})));
 app.get('/api/health',(_req,res)=>res.json({ok:true,graph:graph.status(),model:provider.configured?'configured':'disconnected'}));
 app.get('/api/connectors',(_req,res)=>res.json({connectors:connectors.list()}));
 app.get('/api/capabilities',(_req,res)=>res.json({tools:workTools.list(),mcp:remoteMcp.status()}));
@@ -116,7 +152,9 @@ app.get('/api/events',(req,res)=>{
   const heartbeat=setInterval(()=>res.write(': heartbeat\n\n'),20000);
   req.on('close',()=>{clearInterval(heartbeat);listeners.delete(res);});
 });
-app.post('/api/missions',route(async(req,res)=>res.json(await engine.createMission(req.body))));
+app.get('/api/workflows',(_req,res)=>res.json({workflows:workflows.list()}));
+app.post('/api/workflows',route(async(req,res)=>res.json({workflow:await workflows.save(req.body)})));
+app.post('/api/missions',route(async(req,res)=>res.json(await engine.createMission({...req.body,workflow:req.body.workflowId?workflows.get(req.body.workflowId):null},{background:req.get('x-mova-client')==='web'}))));
 app.post('/api/missions/:id/select',route(async(req,res)=>res.json(await engine.selectMission(req.params.id))));
 app.post('/api/missions/:id/context',route(async(req,res)=>res.json(await engine.updateWorkContext(req.params.id,req.body.text))));
 app.post('/api/missions/:id/proposals/:proposalId',route(async(req,res)=>res.json(await engine.resolveWorkProposal(req.params.id,req.params.proposalId,req.body.revision,req.body.outcome))));
@@ -140,4 +178,4 @@ app.post('/api/speech',route(async(req,res)=>{const audio=await adapters.speech(
 if(existsSync(resolve('dist/index.html'))){app.use(express.static(resolve('dist'),{maxAge:0}));app.get('/{*path}',(_req,res)=>res.sendFile(resolve('dist/index.html')));}
 app.use((error,_req,res,_next)=>{const message=String(error.message||'Request failed').replace(/(?:AIza|sk_)[A-Za-z0-9_-]{15,}/g,'[redacted]');res.status(error.status||error.statusCode||400).json({error:message});});
 const server=app.listen(port,host,()=>console.log(`MOVA agent http://${host}:${port} · graph ${graph.status().connected?'connected':'unavailable'}`));
-for(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>{clearInterval(trackingTimer);clearInterval(mentionTimer);for(const res of listeners)res.end();server.close(async()=>{await Promise.allSettled([graph.close(),workGraph.close(),remoteMcp.close()]);process.exit(0);});});
+for(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>{clearInterval(trackingTimer);clearInterval(mentionTimer);clearInterval(incidentTimer);for(const res of listeners)res.end();server.close(async()=>{await Promise.allSettled([graph.close(),workGraph.close(),operationsGraph.close(),remoteMcp.close()]);process.exit(0);});});

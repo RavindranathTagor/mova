@@ -1,0 +1,120 @@
+.avatar-expression-trigger {
+  position: relative;
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  line-height: 0;
+  cursor: pointer;
+}
+
+.avatar-expression-trigger::after {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #2458a6;
+  color: #fff;
+  content: '+';
+  font-size: 16px;
+  line-height: 1;
+}
+
+.avatar-player {
+  display: block;
+}
+
+.avatar-expression-dialog {
+  width: min(560px, calc(100vw - 24px));
+  max-width: none;
+  max-height: min(760px, calc(100vh - 24px));
+  padding: 20px;
+  overflow: auto;
+  border: 1px solid #dce3ed;
+  border-radius: 16px;
+  background: #fff;
+  color: #1c2b42;
+  box-shadow: 0 20px 70px #13253c40;
+}
+
+.avatar-expression-dialog::backdrop {
+  background: #14223980;
+}
+
+.avatar-expression-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.avatar-expression-heading h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.avatar-expression-heading p {
+  margin: 4px 0 0;
+  color: #66758b;
+  font-size: 13px;
+}
+
+.avatar-expression-close {
+  padding: 7px 10px;
+  border: 1px solid #dce3ed;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.avatar-expression-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.avatar-expression-option {
+  min-width: 0;
+  padding: 5px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #fff;
+  color: #26364d;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.avatar-expression-option:hover,
+.avatar-expression-option[aria-pressed='true'] {
+  border-color: #4782d4;
+  background: #f3f7fd;
+}
+
+.avatar-expression-preview {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1.5;
+  margin-bottom: 4px;
+  border-radius: 6px;
+  background-image: url('/images/avatars/mova-avatar-expressions.jpeg');
+  background-repeat: no-repeat;
+  background-size: 400% 400%;
+}
+
+@media (max-width: 520px) {
+  .avatar-expression-dialog {
+    padding: 14px;
+  }
+
+  .avatar-expression-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

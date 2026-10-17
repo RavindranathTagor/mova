@@ -8,10 +8,19 @@ const poseFrames: Record<string, number[]> = {
   unknown: [0, 4, 0], failed_retryable: [4, 0, 4], replanning: [9, 10, 9], listening: [3, 3, 0, 3],
 };
 
-export default function AvatarMotion({ state = 'idle' }: { state?: string }) {
+const expressionPoseFrames: Record<string, number[]> = {
+  restful: [10], idle: [0, 0, 2, 0, 1, 0], detected: [5, 0, 5], mission_created: [7, 0, 7],
+  building_context: [4, 4, 5, 4], investigating: [4, 5, 4, 1], planning: [2, 2, 3, 2],
+  policy_check: [3, 1, 3], awaiting_approval: [2, 1, 2], executing: [4, 4, 5, 4],
+  verifying: [5, 0, 5], resolved: [6, 8, 6, 15], warning: [3, 0, 3], blocked: [3],
+  unknown: [1, 3, 1], failed_retryable: [3, 1, 3], replanning: [2, 3, 2], listening: [14, 1, 14],
+};
+
+export default function AvatarMotion({ state = 'idle', expression, expressionGallery = false }: { state?: string; expression?: number; expressionGallery?: boolean }) {
   const frame = useCurrentFrame();
-  const frames = poseFrames[state.toLowerCase()] ?? poseFrames.idle;
-  const pose = frames[Math.floor(frame / 24) % frames.length];
+  const poses = expressionGallery ? expressionPoseFrames : poseFrames;
+  const frames = poses[state.toLowerCase()] ?? poses.idle;
+  const pose = expression ?? frames[Math.floor(frame / 24) % frames.length];
   const bob = Math.sin((frame / 90) * Math.PI * 2) * 1.5;
   const celebratory = state.toLowerCase() === 'resolved';
   const lift = celebratory
@@ -24,9 +33,9 @@ export default function AvatarMotion({ state = 'idle' }: { state?: string }) {
       aria-label="Cream-colored MOVA dog wearing its blue cap"
       style={{
         width: '100%', height: '100%',
-        backgroundImage: `url("${staticFile('Avatar.png')}")`,
-        backgroundSize: '400% 300%',
-        backgroundPosition: `${(pose % 4) * 100 / 3}% ${Math.floor(pose / 4) * 50}%`,
+        backgroundImage: `url("${staticFile(expressionGallery ? 'images/avatars/mova-avatar-expressions.jpeg' : 'Avatar.png')}")`,
+        backgroundSize: expressionGallery ? '400% 400%' : '400% 300%',
+        backgroundPosition: `${(pose % 4) * 100 / 3}% ${Math.floor(pose / 4) * (expressionGallery ? 100 / 3 : 50)}%`,
         backgroundRepeat: 'no-repeat',
         transform: `translateY(${bob + lift}px)`,
         transformOrigin: '50% 75%',
