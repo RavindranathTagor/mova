@@ -506,3 +506,4 @@ Potential future work (not current functionality): transactional or replayable m
 ## Closing
 
 MOVA’s core value is an auditable path from a user objective to connected-source evidence and a verified outcome. The model helps interpret and plan; FalkorDB represents dependencies and controls which work step is ready; connectors provide external evidence; and user approval gates supported external writes. This makes both the result and its limitations inspectable by evaluators and developers.
+Development updates are maintained in the beer branch.
