@@ -1,5 +1,6 @@
-import { Database, GitBranch, MessageSquareText, ShieldCheck, Wrench } from 'lucide-react';
+import { ArrowUpRight, Database, GitBranch, MessageSquareText, ShieldCheck, Wrench } from 'lucide-react';
 import type { GraphEdge, Mission, Trace } from '../types';
+import { visibleExecutionTraces } from '../execution.mjs';
 import './execution-console.css';
 
 const eventExpressions = {
@@ -49,7 +50,7 @@ function Path({mission,edges}:{mission:Mission;edges:GraphEdge[]}){
 
 function AgentRoles({mission}:{mission:Mission}){
   const steps=mission.work?.steps||[];
-  const traces=mission.trace;
+  const traces=visibleExecutionTraces(mission.trace);
   const graphQueries=traces.filter(trace=>trace.query).length;
   const roles=[
     {name:'Orchestrator',detail:steps.length?`${steps.length} graph-planned tool step${steps.length===1?'':'s'}`:'Interpreting the request',active:traces.some(trace=>trace.title==='Work plan created')},
@@ -61,23 +62,37 @@ function AgentRoles({mission}:{mission:Mission}){
 }
 
 function LiveGraph({mission}:{mission:Mission}){
-  const visible=mission.graph.nodes.filter(node=>['Mission','Mention','Evidence','Step','Decision','ActionProposal','ActionReceipt'].includes(node.type)).slice(0,7);
-  const ids=new Set(visible.map(node=>node.id));
-  const edges=mission.graph.edges.filter(edge=>ids.has(edge.source)&&ids.has(edge.target)).slice(0,7);
-  return <section className="live-graph" aria-label="Live FalkorDB mission graph"><header><div><Database size={17}/><div><h2>Live FalkorDB graph</h2><p>Nodes and relationships materialized from this mission.</p></div></div><span>{mission.graph.nodes.length} nodes · {mission.graph.edges.length} edges</span></header>{visible.length?<><div className="live-graph-nodes">{visible.map((node,index)=><div className={`live-graph-node type-${node.type.toLowerCase()}`} key={node.id}><small>{node.type}</small><strong>{node.label}</strong>{index<visible.length-1?<i aria-hidden="true">→</i>:null}</div>)}</div><ol className="live-graph-edges">{edges.map(edge=><li key={edge.id}><strong>{nodeLabel(mission,edge.source)}</strong><span>{edge.label.replaceAll('_',' ').toLowerCase()}</span><strong>{nodeLabel(mission,edge.target)}</strong></li>)}</ol></>:<p className="execution-empty">FalkorDB will materialize this mission graph as MOVA gathers evidence.</p>}</section>;
+  const nodes=mission.graph.nodes;
+  const edges=mission.graph.edges;
+  return <section className="live-graph" id="live-falkordb-graph" tabIndex={-1} aria-label="Live FalkorDB mission graph"><header><div><Database size={17}/><div><h2>Live FalkorDB graph</h2><p>All nodes and relationships materialized from this mission.</p></div></div><span>{nodes.length} nodes · {edges.length} edges</span></header>{nodes.length?<><ul className="live-graph-nodes">{nodes.map(node=><li className={`live-graph-node type-${node.type.toLowerCase()}`} key={node.id}><small>{node.type}</small><strong>{node.label}</strong></li>)}</ul>{edges.length?<ol className="live-graph-edges">{edges.map(edge=><li key={edge.id}><strong>{nodeLabel(mission,edge.source)}</strong><span>{edge.label.replaceAll('_',' ').toLowerCase()}</span><strong>{nodeLabel(mission,edge.target)}</strong></li>)}</ol>:<p className="execution-empty">No relationships have been recorded yet.</p>}</>:<p className="execution-empty">FalkorDB will materialize this mission graph as MOVA gathers evidence.</p>}</section>;
+}
+
+const activeMissionStates=['DETECTED','MISSION_CREATED','BUILDING_CONTEXT','INVESTIGATING','PLANNING','REPLANNING','EXECUTING','VERIFYING'];
+function eventStatus(trace:Trace,index:number,count:number,mission:Mission){
+  const status=(trace.status||'').toLowerCase();
+  if(/failed|blocked|error/.test(status)||/blocked|failed|unavailable/i.test(trace.title))return 'blocked';
+  if(/verified|completed|success/.test(status))return 'complete';
+  if(/pending/.test(status))return 'pending';
+  if(index===count-1&&['BLOCKED','FAILED_RETRYABLE','UNKNOWN'].includes(mission.state))return 'blocked';
+  const runningStep=mission.work?.steps.find(step=>['running','executing'].includes(step.status.toLowerCase()));
+  if(index===count-1&&activeMissionStates.includes(mission.state)&&(!runningStep||runningStep.tool===trace.tool))return 'active';
+  if(index===count-1&&mission.state==='RESOLVED'&&/resolved|complete|verified/i.test(trace.title))return 'complete';
+  return 'recorded';
 }
 
 export default function ExecutionConsole({mission}:{mission:Mission}){
-  const traces=mission.trace;
+  const traces=visibleExecutionTraces(mission.trace);
   const latest=traces.at(-1);
   const graphTraces=traces.filter(trace=>trace.query);
   const toolCalls=mission.work?.steps||[];
   return <section className="execution-console" aria-labelledby="execution-console-title">
-    <header className="execution-console-header"><div><p className="console-kicker">Agents that act on connected data</p><h1 id="execution-console-title">MOVA’s investigation</h1><p>A source-grounded execution record: each tool, graph traversal, decision, and reviewable action appears as it occurs.</p></div><div className="console-metrics"><span>{mission.graph.nodes.length} nodes</span><span>{mission.graph.edges.length} relationships</span><span>{graphTraces.length} Cypher queries</span></div></header>
+    <header className="execution-console-header"><div><p className="console-kicker">LIVE EXECUTION</p><h1 id="execution-console-title">MOVA’s investigation</h1><p>Backend events, evidence and tool calls as they happen.</p></div><div className="console-header-actions"><div className="console-metrics"><span>{mission.graph.nodes.length} nodes</span><span>{mission.graph.edges.length} relationships</span><span>{graphTraces.length} Cypher queries</span></div><a className="open-live-graph" href="#live-falkordb-graph">Open Live FalkorDB Graph<ArrowUpRight size={15}/></a></div></header>
     <div className="execution-console-grid">
       <section className="execution-thread" aria-label="Agent conversation" aria-live="polite">
         <article className="console-message user-message"><span>You asked</span><p>{mission.goal}</p></article>
-        {traces.length?traces.map(trace=><article className="console-message agent-message" key={trace.id}><ExecutionEventAvatar trace={trace}/><div><header><strong>MOVA</strong><span>{kind(trace)} · {time(trace.at)}</span></header><h2><Icon trace={trace}/>{trace.title}</h2><p>{trace.detail}</p>{trace.source&&<small>Source: {trace.source}</small>}{trace.query&&<><span className="cypher-chip" title={compact(trace.query)}>Cypher gate · hover for condensed query</span><details><summary>Inspect this FalkorDB decision</summary><p>This traversal evaluated the graph at this point in the mission. Its result changes as completed evidence changes.</p>{trace.result?<pre>{JSON.stringify(trace.result,null,2)}</pre>:null}<summary>Inspect the executed Cypher</summary><pre>{trace.query}</pre></details></>}</div></article>):<p className="execution-empty">MOVA is waiting for an investigation.</p>}
+        <h2 className="flow-section-title">Execution timeline</h2>
+        {traces.length?<ol className="execution-flow" aria-label="Backend execution events">{traces.map((trace,index)=>{const status=eventStatus(trace,index,traces.length,mission);const statusLabel=status==='active'?'In progress':status==='complete'?'Complete':status==='blocked'?'Needs attention':status==='pending'?'Pending':'Recorded';return <li className={`flow-event is-${status}`} key={trace.id} aria-current={status==='active'?'step':undefined} aria-label={`${trace.title}: ${statusLabel}`}><span className="flow-marker" aria-hidden="true">{status==='complete'?'✓':status==='blocked'?'!':status==='active'?<span/>:'·'}</span><article className="console-message agent-message"><ExecutionEventAvatar trace={trace}/><div><header><strong>MOVA</strong><span>{kind(trace)} · {time(trace.at)}</span><span className="flow-status-label">{statusLabel}</span></header><h3><Icon trace={trace}/>{trace.title}</h3><p>{trace.detail}</p>{trace.source&&<small>Source: {trace.source}</small>}{trace.query&&<><span className="cypher-chip" title={compact(trace.query)}>Cypher gate · hover for condensed query</span><details><summary>Inspect this FalkorDB decision</summary><p>This traversal evaluated the graph at this point in the mission. Its result changes as completed evidence changes.</p>{trace.result?<pre>{JSON.stringify(trace.result,null,2)}</pre>:null}<summary>Inspect the executed Cypher</summary><pre>{trace.query}</pre></details></>}</div></article></li>})}</ol>:<p className="execution-empty">MOVA is waiting for the first backend event.</p>}
+        {toolCalls.length>0&&<section className="planned-flow" aria-label="Backend work plan"><h2>Work plan</h2><p>Steps appear here when the backend creates the plan.</p><ol className="execution-flow">{toolCalls.map(step=>{const status=['completed','verified','success'].includes(step.status.toLowerCase())?'complete':['running','executing'].includes(step.status.toLowerCase())?'active':['failed','blocked'].includes(step.status.toLowerCase())?'blocked':'pending';return <li key={step.id} className={`flow-event is-${status}`} aria-current={status==='active'?'step':undefined}><span className="flow-marker" aria-hidden="true">{status==='complete'?'✓':status==='blocked'?'!':status==='active'?<span/>:'·'}</span><article className="console-message agent-message"><ExecutionEventAvatar trace={{id:step.id,at:latest?.at||mission.createdAt,kind:'tool',title:step.title,detail:step.summary||step.title,tool:step.tool,status:step.status}}/><div><header><strong>{step.tool}</strong><span className={`tool-call-status is-${step.status}`}>{step.status}</span></header><h3>{step.title}</h3><p>{step.summary||step.title}</p>{step.dependsOn.length>0&&<small>Dependencies: {step.dependsOn.join(', ')}</small>}</div></article></li>})}</ol></section>}
       </section>
       <aside className="execution-explain" aria-label="Graph explanation">
         <LiveGraph mission={mission}/>
