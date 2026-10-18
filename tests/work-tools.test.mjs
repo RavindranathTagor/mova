@@ -67,6 +67,19 @@ test('Discord mention missions retain the complete raw multi-line request',async
  const events=await tools.listMentions();const mention=events.find(event=>event.eventId==='discord:1559991811965984890:message-1');
  assert.ok(mention);assert.equal(mention.content,request);assert.match(mention.content,/Issue 1: feature 1 system architecture design/);assert.match(mention.content,/Issue 2: small game required/);assert.match(mention.content,/reply in Discord/);
 });
+test('Discord mention polling reports channel failures without exposing credentials',async()=>{
+ const env={MOVA_GRAPH_DATA_ATTESTATION:'public_or_owned',DISCORD_BOT_TOKEN:'private-discord-token',DISCORD_ALLOWED_CHANNEL_IDS:'1559991811965984890'};
+ const discordMentionState={checkedAt:null,errors:[]};
+ const tools=createWorkTools({env,discordMentionState,fetchImpl:async()=>new Response('forbidden',{status:403})});
+ const statusReader=createWorkTools({env,discordMentionState});
+ assert.equal(tools.getDiscordMentionStatus().status,'checking');
+ assert.deepEqual(await tools.listMentions(),[]);
+ const status=statusReader.getDiscordMentionStatus();
+ assert.equal(status.status,'unavailable');
+ assert.match(status.detail,/Discord request failed \(403\)/);
+ assert.doesNotMatch(status.detail,/private-discord-token/);
+ assert.ok(status.checkedAt);
+});
 
 test('chat-source reads require an explicit public-or-owned graph attestation', async () => {
  const tools=createWorkTools({env:{SLACK_BOT_TOKEN:'slack-secret',SLACK_ALLOWED_CHANNEL_IDS:'C123'},fetchImpl:async()=>new Response(JSON.stringify({ok:true,messages:[]}))});

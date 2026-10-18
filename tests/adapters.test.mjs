@@ -7,11 +7,21 @@ import { createAdapters } from '../server/adapters.mjs';
 import { createProvider } from '../server/provider.mjs';
 import { distanceMeters, resolveManualPlace, validPoint } from '../server/geo.mjs';
 import { isNearbyPlaceRequest, leafletPoint, locationErrorMessage, locationRequiredForRequest, readBrowserLocation } from '../src/location.mjs';
+import { mergeEnvelope } from '../src/envelope.mjs';
 
 const reply = (data, status = 200) => new Response(JSON.stringify(data), { status });
 
 const tomtomInput = { origin: { latitude: 28, longitude: 77 }, destination: { latitude: 29, longitude: 78 }, deadline: new Date(Date.now() + 3600000).toISOString() };
 const tomtomRoute = (seconds = 1800, delay = 120) => ({ summary: { travelTimeInSeconds: seconds, trafficDelayInSeconds: delay, lengthInMeters: 24000, noTrafficTravelTimeInSeconds: 1680 }, legs: [{ points: [{ latitude: 28, longitude: 77 }, { latitude: 29, longitude: 78 }] }] });
+
+test('stale state events cannot restore resolved attention or replace the selected mission',()=>{
+  const envelope=mission=>({mission,integrations:[],config:{},missions:[]});
+  const resolved={id:'mission-1',state:'RESOLVED',revision:4,trace:[{at:'2026-10-18T00:00:04.000Z'}]};
+  const staleBlocked={id:'mission-1',state:'BLOCKED',revision:3,trace:[{at:'2026-10-18T00:00:03.000Z'}]};
+  assert.equal(mergeEnvelope(envelope(resolved),envelope(staleBlocked)).mission,resolved);
+  const background={id:'background',state:'BLOCKED',revision:1,trace:[{at:'2026-10-18T00:00:01.000Z'}]};
+  assert.equal(mergeEnvelope(envelope(resolved),envelope(background),'mission-1').mission,resolved);
+});
 
 test('coordinate validation, haversine distance and Leaflet markers use consistent latitude-longitude order',()=>{
   assert.deepEqual(validPoint({lat:0,lon:1}),{latitude:0,longitude:1});
@@ -116,6 +126,11 @@ test('TomTom nearby search rejects missing credentials and invalid coordinate in
   await assert.rejects(missing.searchNearbyPlaces({query:'restaurants',location:{latitude:1,longitude:2}}),/TOMTOM_API_KEY/);
   const configured=createAdapters({env:{MAPS_PROVIDER:'tomtom',TOMTOM_API_KEY:'test'}});
   await assert.rejects(configured.searchNearbyPlaces({query:'restaurants',location:{latitude:91,longitude:2}}),/valid current or manually selected location/);
+});
+
+test('nearby provider failures are surfaced instead of returned as fabricated empty results',async()=>{
+  const adapters=createAdapters({env:{MAPS_PROVIDER:'tomtom',TOMTOM_API_KEY:'test'},fetchImpl:async()=>reply({error:'provider unavailable'},503)});
+  await assert.rejects(adapters.searchNearbyPlaces({query:'restaurants',location:{latitude:28.6,longitude:77.2},radiusMeters:1000}),/TomTom Search request failed \(503\)/);
 });
 
 test('planner context keeps all candidates but excludes route geometry and bounds duplicated history', async () => {

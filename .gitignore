@@ -11,6 +11,10 @@ output/
 
 # Test folders
 tests/
+!tests/
+tests/*
+!tests/frontend-state.test.mjs
+!tests/http-policy.test.mjs
 test/
 __tests__/
 

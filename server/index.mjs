@@ -16,6 +16,7 @@ import { createWorkGraph } from './work-graph.mjs';
 import { createRemoteMcp } from './remote-mcp.mjs';
 import { createIncidentRouting } from './incident-routing.mjs';
 import { createOperationsGraph } from './operations-graph.mjs';
+import { isAllowedRequestOrigin } from './http-policy.mjs';
 import { resolveManualPlace, validPoint } from './geo.mjs';
 
 const resources=createResourceRegistry({path:join(process.env.MOVA_DATA_DIR||'.data','resources.json')});
@@ -32,8 +33,9 @@ const traccar=createTraccar({env:process.env});
 const workGraph=createWorkGraph({url:process.env.FALKORDB_URL||'redis://127.0.0.1:6380'});
 const operationsGraph=createOperationsGraph({url:process.env.FALKORDB_URL||'redis://127.0.0.1:6380'});
 const incidentRouting={resolve:event=>createIncidentRouting({env:process.env}).resolve(event)};
-const currentWorkTools=()=>createWorkTools({env:process.env,dataDir:join(process.env.MOVA_DATA_DIR||'.data','artifacts'),adapters,operationsGraph});
-const localWorkTools=Object.fromEntries(['list','call','executeProposal','listMentions','listCustomerReports'].map(name=>[name,(...args)=>currentWorkTools()[name](...args)]));
+const discordMentionState={checkedAt:null,errors:[]};
+const currentWorkTools=()=>createWorkTools({env:process.env,dataDir:join(process.env.MOVA_DATA_DIR||'.data','artifacts'),adapters,operationsGraph,discordMentionState});
+const localWorkTools=Object.fromEntries(['list','call','executeProposal','listMentions','listCustomerReports','getDiscordMentionStatus'].map(name=>[name,(...args)=>currentWorkTools()[name](...args)]));
 const remoteMcp=createRemoteMcp({env:process.env});
 await remoteMcp.init();
 const workTools={list:()=>[...localWorkTools.list(),...remoteMcp.list()],call:(name,args,context)=>name.startsWith('mcp_')?remoteMcp.call(name,args):localWorkTools.call(name,args,context),executeProposal:proposal=>localWorkTools.executeProposal(proposal)};
@@ -45,7 +47,12 @@ let trackingEnabled=true;
 let trackingError=null;
 let trackingMonitoringError=null;
 let trackingRequest;
-const enrich=state=>({...state,integrations:[...state.integrations,traccar.status()],tracking:{enabled:trackingEnabled,configured:traccar.configured,position:trackingPosition,error:trackingError,monitoringError:trackingMonitoringError,serverUrl:process.env.TRACCAR_URL||'http://127.0.0.1:8082'}});
+let mentionPollFailure='';
+let lastMentionSyncBroadcast='';
+const mentionSync=()=>mentionPollFailure
+  ?{status:'unavailable',detail:mentionPollFailure,checkedAt:new Date().toISOString()}
+  :localWorkTools.getDiscordMentionStatus?.()||{status:'checking',detail:'Checking connected mention sources.',checkedAt:null};
+const enrich=state=>({...state,discordSync:mentionSync(),integrations:[...state.integrations,traccar.status()],tracking:{enabled:trackingEnabled,configured:traccar.configured,position:trackingPosition,error:trackingError,monitoringError:trackingMonitoringError,serverUrl:process.env.TRACCAR_URL||'http://127.0.0.1:8082'}});
 const broadcast=state=>{const event=`event: state\ndata: ${JSON.stringify(enrich(state))}\n\n`;for(const response of listeners)response.write(event);};
 const engine=createEngine({graph,store:createStore({path:join(process.env.MOVA_DATA_DIR||'.data','missions.json')}),adapters,provider,workTools,workGraph,operationsGraph,onChange:broadcast});
 await engine.init();
@@ -53,24 +60,40 @@ await operationsGraph.init();
 let mentionPoll;
 const mentionSeen=new Set();
 const incidentSeen=new Set();
-const mentionPollSeconds=Math.max(20,Math.min(300,Number(process.env.MOVA_MENTION_POLL_SECONDS||45)||45));
+const mentionPollSeconds=Math.max(10,Math.min(300,Number(process.env.MOVA_MENTION_POLL_SECONDS||10)||10));
 const mentionMaxAgeMs=Math.max(1,Math.min(60,Number(process.env.MOVA_MENTION_MAX_AGE_MINUTES||10)||10))*60000;
+const publishMentionSync=()=>{
+  const {status,detail}=mentionSync();
+  const fingerprint=JSON.stringify([status,detail]);
+  if(fingerprint!==lastMentionSyncBroadcast){lastMentionSyncBroadcast=fingerprint;broadcast(engine.getState());}
+};
 async function pollMentions(){
   if(mentionPoll)return mentionPoll;
   mentionPoll=(async()=>{
     const events=await localWorkTools.listMentions();
+    mentionPollFailure='';
+    publishMentionSync();
     for(const event of events.slice(-12)){
-      if(mentionSeen.has(event.eventId)||engine.hasMentionEvent(event.eventId))continue;
-      mentionSeen.add(event.eventId);
-      if(Date.now()-Date.parse(event.observedAt)>mentionMaxAgeMs)continue;
+      if(mentionSeen.has(event.eventId))continue;
+      if(engine.hasMentionEvent(event.eventId)){mentionSeen.add(event.eventId);continue;}
+      if(Date.now()-Date.parse(event.observedAt)>mentionMaxAgeMs){mentionSeen.add(event.eventId);continue;}
       const target=event.channelId?`the same ${event.service} channel`:event.repository?`${event.repository} #${event.issueNumber}`:`the originating ${event.service} thread`;
       const replyTool=event.service==='GitHub'?'propose_github_issue_comment':event.service==='Slack'?'propose_slack_message':'propose_discord_message';
       const text=`A verified ${event.service} mention from ${event.source} asks: ${event.content}\n\nInvestigate the request using connected evidence. When an answer is ready, use ${replyTool} to prepare a concise reply to ${target}. Do not send any external message; MOVA must present it for explicit approval.`;
-      try{await engine.createMission({text,deadlineMinutes:90,trigger:event});broadcast(engine.getState());}
+      try{await engine.createMission({text,deadlineMinutes:90,trigger:event},{background:true});mentionSeen.add(event.eventId);}
       catch(error){console.warn(`MOVA could not start a ${event.service} mention mission: ${String(error.message||'unknown error').slice(0,160)}`);}
     }
+    publishMentionSync();
   })();
   try{return await mentionPoll;}finally{mentionPoll=null;}
+}
+async function runMentionPoll(){
+  try{await pollMentions();}
+  catch(error){
+    mentionPollFailure=`Mention synchronization failed: ${String(error?.message||'The connected mention source could not be checked.').slice(0,240)}`;
+    console.warn(`MOVA mention synchronization failed: ${mentionPollFailure}`);
+    publishMentionSync();
+  }
 }
 async function pollCustomerReports(){
   const reports=await localWorkTools.listCustomerReports();
@@ -85,13 +108,13 @@ async function pollCustomerReports(){
       const related=await operationsGraph.findRelated({repository:binding.repository,fingerprint});
       const existingIssueNumber=related.issueNumbers.length===1?related.issueNumbers[0]:null;
       const text=`Customer report from Discord: ${report.content}`;
-      await engine.createMission({text,mode:'live',deadlineMinutes:90,trigger:report,operationalContext:{...binding,kind:'customer_incident',reportId:report.id,fingerprint,existingIssueNumber,relatedPaths:related.paths}},{background:true});broadcast(engine.getState());
+      await engine.createMission({text,mode:'live',deadlineMinutes:90,trigger:report,operationalContext:{...binding,kind:'customer_incident',reportId:report.id,fingerprint,existingIssueNumber,relatedPaths:related.paths}},{background:true});
     }catch(error){console.warn(`MOVA could not start customer incident workflow: ${String(error.message||'unknown error').slice(0,160)}`);}
   }
 }
-const mentionTimer=setInterval(()=>void pollMentions().catch(()=>{}),mentionPollSeconds*1000);
+const mentionTimer=setInterval(()=>void runMentionPoll(),mentionPollSeconds*1000);
 mentionTimer.unref();
-void pollMentions().catch(()=>{});
+void runMentionPoll();
 const incidentTimer=setInterval(()=>void pollCustomerReports().catch(()=>{}),mentionPollSeconds*1000);
 incidentTimer.unref();
 void pollCustomerReports().catch(()=>{});
@@ -128,7 +151,7 @@ app.use((req,res,next)=>{
   if(!['localhost','127.0.0.1','::1','[::1]'].includes(requestHost))return res.status(403).json({error:'Unrecognized local host.'});
   const origin=req.get('origin');
   const allowed=new Set([process.env.APP_ORIGIN||'http://localhost:5173','http://127.0.0.1:5173',`http://localhost:${port}`,`http://127.0.0.1:${port}`]);
-  if(origin&&!allowed.has(origin))return res.status(403).json({error:'Cross-origin request denied.'});
+  if(!isAllowedRequestOrigin(origin,`${req.protocol}://${req.get('host')}`,allowed))return res.status(403).json({error:'Cross-origin request denied.'});
   if(!['GET','HEAD','OPTIONS'].includes(req.method)&&(!req.is('application/json')||!req.get('x-mova-client')))return res.status(403).json({error:'A same-origin MOVA request is required.'});
   const cookie=req.headers.cookie?.split(';').map(x=>x.trim()).find(x=>x.startsWith('mova_session='))?.slice(13);
   let sessionId;

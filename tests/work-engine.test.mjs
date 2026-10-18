@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict';
 import {approveWorkProposal,runWorkMission,validateWorkPlan} from '../server/work-engine.mjs';
 const schema=properties=>({type:'object',properties,additionalProperties:false});
-const catalog=[{name:'web_search',description:'Search',inputSchema:schema({query:{type:'string'}})},{name:'save_artifact',description:'Save',effect:'write',inputSchema:schema({title:{type:'string'},content:{type:'string'},sourceIds:{type:'array'}})},{name:'list_artifacts',description:'Read artifacts',inputSchema:schema({})}];
-const plan=()=>({status:'ready',summary:'Research then save',steps:[{id:'research',title:'Read sources',tool:'web_search',args:{query:'Graph databases'},dependsOn:[]},{id:'report',title:'Save report',tool:'save_artifact',args:{},dependsOn:['research']}]});
+const catalog=[{name:'web_search',description:'Search',inputSchema:schema({query:{type:'string'}})},{name:'save_artifact',description:'Save',effect:'write',inputSchema:{...schema({title:{type:'string',minLength:1,maxLength:200},content:{type:'string',minLength:1,maxLength:100000},sourceIds:{type:'array',maxItems:100}}),required:['title','content','sourceIds']}},{name:'list_artifacts',description:'Read artifacts',inputSchema:schema({})}];
+const plan=()=>({status:'ready',summary:'Research then save',steps:[{id:'research',title:'Read sources',tool:'web_search',args:{query:'Graph databases'},dependsOn:[]},{id:'report',title:'Save report',tool:'save_artifact',args:{title:'Research report',sourceIds:[]},dependsOn:['research']}]});
 function fixture(options={}){
  const mission={id:'work-test',kind:'work',goal:'Research graph databases and save a report',revision:0,receipts:[],trace:[]};let sourceCalls=0,saveCalls=0,modelCalls=0;const artifacts=[];
  const workTools={list:()=>catalog,call:async(name,args,context)=>{if(name==='web_search'){sourceCalls++;return {source:'Search fixture',observedAt:new Date().toISOString(),results:[{title:'Graph source',url:'https://example.org/graph',snippet:'Graph databases represent connected records.'}]};}if(name==='list_artifacts')return {artifacts};if(name==='save_artifact'){saveCalls++;const artifact={id:'saved',...args,idempotencyKey:context.idempotencyKey,verifiedAt:new Date().toISOString()};artifacts.push(artifact);return artifact;}throw new Error('Unknown tool');}};
@@ -15,8 +15,98 @@ function fixture(options={}){
 test('work executes graph-ready typed MCP tools and verifies artifact readback',async()=>{
  const f=fixture();await runWorkMission(f);assert.equal(f.mission.state,'RESOLVED');assert.equal(f.mission.work.artifacts[0].content,f.mission.work.answer);assert.deepEqual(f.counts(),{sourceCalls:1,saveCalls:1,modelCalls:1});assert.ok(f.mission.work.steps.every(s=>s.status==='completed'));await runWorkMission(f);assert.deepEqual(f.counts(),{sourceCalls:1,saveCalls:1,modelCalls:1});
 });
+test('artifact plans defer missing, empty, and whitespace content to evidence-backed synthesis',async()=>{
+ for(const plannerContent of [undefined,'',' \n ','Unverified planner text']){
+  const f=fixture();f.provider.planWork=async()=>{const next=plan();if(plannerContent!==undefined)next.steps[1].args.content=plannerContent;return next;};
+  await runWorkMission(f);
+  assert.equal(f.mission.state,'RESOLVED');
+  assert.equal(f.mission.work.artifacts[0].content,'Graph databases represent connected records.');
+  assert.deepEqual(f.mission.work.artifacts[0].sourceIds,[f.mission.work.evidence[0].id]);
+  assert.equal(f.counts().saveCalls,1);
+ }
+});
+test('missing, empty, and whitespace-only synthesized content fail before artifact execution',async()=>{
+ for(const content of [undefined,'',' \n\t']){
+  const f=fixture();let planCalls=0;
+  f.provider.planWork=async()=>{planCalls++;return plan();};
+  f.provider.synthesizeWork=async({evidence})=>({...(content===undefined?{}:{answer:content}),title:'Research report',sourceIds:[evidence[0].id]});
+  await assert.rejects(runWorkMission(f),/synthesized answer content/i);
+  assert.equal(planCalls,1,'an invalid plan is not automatically requested again');
+  assert.equal(f.counts().sourceCalls,1);
+  assert.equal(f.counts().saveCalls,0);
+  assert.equal(f.mission.work.steps.find(step=>step.id==='report').status,'failed');
+  assert.match(f.mission.work.steps.find(step=>step.id==='report').summary,/synthesized answer content/i);
+ }
+});
+test('resuming a failed artifact step preserves completed work, evidence, and mission history',async()=>{
+ const f=fixture();const evidence={id:'existing-evidence',stepId:'research',title:'Existing source',source:'Search fixture',observedAt:new Date().toISOString(),summary:'Previously verified finding.',stale:false};
+ f.mission.work={steps:[
+  {id:'research',title:'Read sources',tool:'web_search',args:{query:'Graph databases'},dependsOn:[],status:'completed',summary:'Retrieved 1 source record.'},
+  {id:'report',title:'Save report',tool:'save_artifact',args:{title:'Research report',sourceIds:[]},dependsOn:['research'],status:'failed',summary:'Prior invalid generated content.'},
+ ],evidence:[evidence],artifacts:[],proposals:[]};
+ f.mission.work.planRevision=f.mission.revision;f.mission.trace.push({title:'Existing investigation history'});f.mission.receipts.push({id:'existing-receipt'});
+ const priorEvidence=structuredClone(f.mission.work.evidence),priorRevision=f.mission.revision,priorMissionId=f.mission.id;
+ await runWorkMission(f);
+ assert.equal(f.mission.id,priorMissionId);assert.equal(f.mission.revision,priorRevision);
+ assert.equal(f.mission.work.steps.find(step=>step.id==='research').status,'completed');
+ assert.deepEqual(f.mission.work.evidence.filter(item=>item.id==='existing-evidence'),priorEvidence);
+ assert.ok(f.mission.trace.some(item=>item.title==='Existing investigation history'));
+ assert.ok(f.mission.receipts.some(item=>item.id==='existing-receipt'));
+ assert.equal(f.counts().sourceCalls,0);
+ assert.equal(f.counts().saveCalls,1);
+});
+test('citation failure records a source-limited result once and preserves resumed work',async()=>{
+ const f=fixture();const observedAt=new Date().toISOString();f.mission.goal='Compare GitHub issues and recommend the highest-priority improvement.';
+ const evidence=[
+  {id:'empty-search-1',stepId:'read-1',title:'GitHub issue search returned no matches',url:'https://github.com/owner/demo/issues?q=first',source:'GitHub issues',observedAt,summary:'No issue records matched the first search.',stale:false},
+  {id:'empty-search-2',stepId:'read-2',title:'GitHub issue search returned no matches',url:'https://github.com/owner/demo/issues?q=second',source:'GitHub issues',observedAt,summary:'No issue records matched the second search.',stale:false},
+ ];
+ f.mission.work={steps:[
+  {id:'read-1',title:'Search first issue',tool:'read_github_issues',args:{repository:'owner/demo'},dependsOn:[],status:'completed',summary:'No issue records matched.'},
+  {id:'read-2',title:'Search second issue',tool:'read_github_issues',args:{repository:'owner/demo'},dependsOn:[],status:'completed',summary:'No issue records matched.'},
+ ],evidence,artifacts:[],proposals:[]};
+ f.mission.work.planRevision=f.mission.revision;
+ f.mission.trace.push({title:'Existing investigation history'});f.mission.receipts.push({id:'existing-receipt'});
+ let synthesisCalls=0;f.provider.synthesizeWork=async()=>{synthesisCalls++;return {answer:'GitHub issue #6 is the highest priority.',title:'Unsupported result',sourceIds:['not-current']};};
+ const priorEvidence=structuredClone(evidence);
+ await runWorkMission(f);
+ assert.equal(f.mission.id,'work-test');assert.equal(f.mission.state,'BLOCKED');
+ assert.equal(synthesisCalls,2,'the model receives only one constrained retry');
+ assert.match(f.mission.work.answer,/could not verify a source-backed conclusion/i);
+ assert.match(f.mission.work.answer,/No repository or issue findings are asserted/i);
+ assert.deepEqual(f.mission.work.sourceIds,['empty-search-1','empty-search-2']);
+ assert.deepEqual(f.mission.work.evidence,priorEvidence);
+ assert.ok(f.mission.trace.some(item=>item.title==='Existing investigation history'));
+ assert.ok(f.mission.receipts.some(item=>item.id==='existing-receipt'));
+ assert.ok(f.mission.summary.includes('source-limited result'));
+ assert.equal(f.counts().sourceCalls,0);
+ await runWorkMission(f);
+ assert.equal(synthesisCalls,2,'resuming reuses the persisted limitation rather than retrying');
+ assert.equal(f.counts().sourceCalls,0);
+});
 test('no graph-ready step means no tool can execute',async()=>{
  const f=fixture();f.workGraph.ready=async()=>({stepIds:[],query:'blocked dependencies',params:{}});await assert.rejects(runWorkMission(f),/graph-ready/);assert.equal(f.counts().sourceCalls,0);
+});
+test('resume locally rechecks saved dependencies when FalkorDB releases no previously blocked step',async()=>{
+ const f=fixture();let analysisCalls=0;
+ const evidence={id:'read-evidence',stepId:'read',title:'Verified source',source:'GitHub',observedAt:new Date().toISOString(),summary:'The repository dependency is React.',evidenceKind:'observed',stale:false};
+ f.mission.work={steps:[
+  {id:'read',title:'Read dependency manifest',tool:'read_github_code',args:{repository:'owner/demo',path:'package.json'},dependsOn:[],status:'completed',summary:'Retrieved 1 source record.'},
+  {id:'impact',title:'Analyze dependency impact',tool:'analyze_falkordb_impact',args:{},dependsOn:['read'],status:'blocked',summary:'Skipped because a required step did not produce verified evidence.'},
+  {id:'report',title:'Save dependency report',tool:'save_artifact',args:{title:'Dependency report',sourceIds:[]},dependsOn:['impact'],status:'blocked',summary:'Skipped because a required step did not produce verified evidence.'},
+ ],evidence:[evidence],artifacts:[],proposals:[]};
+ f.workGraph.ready=async()=>({stepIds:[],query:'empty result despite saved evidence',params:{}});
+ f.workGraph.analyzeImpact=async()=>{analysisCalls++;return {source:'FalkorDB',observedAt:new Date().toISOString(),evidenceKind:'calculated_estimate',results:[{id:'impact-evidence',title:'Dependency impact path',summary:'The graph connects the dependency evidence to the investigation.'}]}};
+ f.provider.synthesizeWork=async({evidence:items})=>({answer:'The graph-linked dependency evidence is available.',title:'Verified result',sourceIds:[items[0].id]});
+ await runWorkMission(f);
+ assert.equal(analysisCalls,1);
+ assert.equal(f.mission.work.steps.find(step=>step.id==='read').status,'completed');
+ assert.equal(f.mission.work.steps.find(step=>step.id==='impact').status,'completed');
+ assert.equal(f.mission.work.steps.find(step=>step.id==='report').status,'completed');
+ assert.ok(f.mission.work.evidence.some(item=>item.id==='read-evidence'&&!item.stale));
+ assert.ok(f.mission.trace.some(item=>item.title==='Revalidating saved dependency before resume'));
+ assert.ok(f.mission.work.artifacts.length);
+ assert.equal(f.mission.state,'RESOLVED');
 });
 test('workflow limits the planner catalog and rejects an unselected tool',async()=>{
  const f=fixture();f.mission.workflow={id:'research',name:'Research',connectors:['web'],tools:['web_search'],instructions:'Research only',resources:{}};
@@ -131,7 +221,7 @@ test('replanning after user context discards stale and duplicate evidence instea
  assert.ok(f.mission.work.evidence.some(item=>!item.stale&&item.stepId==='new_read'));
 });
 test('a failed read is retried once, then skipped while independent verified evidence continues',async()=>{
- const f=fixture();let failedCalls=0,notes,evidenceSeen;
+ const f=fixture();f.mission.goal='Research graph databases using https://example.org/source and save a report.';let failedCalls=0,notes,evidenceSeen;
  const readTools=[
   {name:'web_search',description:'Search',effect:'read',inputSchema:schema({query:{type:'string'}})},
   {name:'read_web_page',description:'Read page',effect:'read',inputSchema:schema({url:{type:'string'}})},
@@ -152,6 +242,53 @@ test('a failed read is retried once, then skipped while independent verified evi
  assert.equal(f.mission.work.steps.find(step=>step.id==='available_read').status,'completed');
  assert.equal(evidenceSeen.length,1);assert.ok(notes.some(note=>note.includes('temporary upstream error')));
  assert.match(f.mission.summary,/partial result/i);assert.ok(f.mission.work.answer,'verified partial answer remains available');
+});
+test('dependency searches use the exact package name and declared version from repository evidence',async()=>{
+ const f=fixture();f.mission.goal='Research the latest release of a real dependency in the connected repository.';
+ let searchQuery='',synthesisNotes=[];
+ f.provider.synthesizeWork=async({evidence,notes})=>{synthesisNotes=notes;return {answer:'The available evidence supports only this limitation.',title:'Dependency research limitation',sourceIds:[evidence[0].id]};};
+ f.workTools.list=()=>[...catalog,{name:'read_github_code',description:'Read source',effect:'read',inputSchema:schema({repository:{type:'string'},path:{type:'string'}})}];
+ f.provider.planWork=async()=>({status:'ready',steps:[
+  {id:'manifest',title:'Read package manifest',tool:'read_github_code',args:{repository:'owner/demo',path:'package.json'},dependsOn:[]},
+  {id:'search',title:'Search latest dependency release',tool:'web_search',args:{query:'latest release known issues 2026'},dependsOn:['manifest']},
+ ]});
+ const original=f.workTools.call;
+ f.workTools.call=async(name,args,context)=>{
+  if(name==='read_github_code')return {source:'GitHub code',observedAt:new Date().toISOString(),results:[{title:'owner/demo/package.json',summary:JSON.stringify({name:'slate.me',private:true,dependencies:{react:'^18.3.1'}})}]};
+  if(name==='web_search'){searchQuery=args.query;return {source:'SearXNG',observedAt:new Date().toISOString(),results:[{title:'React blog',url:'https://react.dev/blog',summary:'React release information.'}]};}
+  return original(name,args,context);
+ };
+ await runWorkMission(f);
+ assert.equal(searchQuery,'react ^18.3.1 latest release official documentation release notes known issues');
+ assert.ok(synthesisNotes.some(note=>note.includes('react at declared range ^18.3.1')));
+ assert.ok(synthesisNotes.some(note=>note.includes('package.json.private as repository privacy')));
+ assert.equal(f.mission.state,'RESOLVED');
+ assert.ok(f.mission.trace.some(item=>item.title==='Search grounded in the repository manifest'));
+});
+test('an unverified planned page URL is replaced with a package-grounded search without losing completed evidence',async()=>{
+ const f=fixture();f.mission.goal='Research latest release of a real dependency in this repository and save a report.';
+ let pageCalls=0,searchCalls=0;
+ f.workTools.list=()=>[...catalog,{name:'read_github_code',description:'Read source',effect:'read',inputSchema:schema({repository:{type:'string'},path:{type:'string'}})},{name:'read_web_page',description:'Read page',effect:'read',inputSchema:schema({url:{type:'string'}})}];
+ f.provider.planWork=async()=>({status:'ready',steps:[
+  {id:'manifest',title:'Read package manifest',tool:'read_github_code',args:{repository:'owner/demo',path:'package.json'},dependsOn:[]},
+  {id:'official',title:'Read official release notes',tool:'read_web_page',args:{url:'https://github.com/releases'},dependsOn:['manifest']},
+  {id:'report',title:'Save report',tool:'save_artifact',args:{title:'Dependency report',sourceIds:[]},dependsOn:['official']},
+ ]});
+ const original=f.workTools.call;
+ f.workTools.call=async(name,args,context)=>{
+  if(name==='read_github_code')return {source:'GitHub code',observedAt:new Date().toISOString(),results:[{title:'owner/demo/package.json',summary:JSON.stringify({dependencies:{react:'^18.3.1'}})}]};
+  if(name==='read_web_page'){pageCalls++;throw new Error('Public website request failed (404)');}
+  if(name==='web_search'){searchCalls++;assert.match(args.query,/react \^18\.3\.1/);return {source:'SearXNG',observedAt:new Date().toISOString(),results:[{title:'React blog',url:'https://react.dev/blog',summary:'Release notes for React.'}]};}
+  return original(name,args,context);
+ };
+ await runWorkMission(f);
+ assert.equal(pageCalls,0,'an unverified URL is never fetched');
+ assert.equal(searchCalls,1);
+ assert.equal(f.mission.state,'RESOLVED');
+ assert.equal(f.mission.work.steps.find(step=>step.id==='manifest').status,'completed');
+ assert.ok(f.mission.work.evidence.some(item=>item.stepId==='manifest'&&!item.stale));
+ assert.ok(f.mission.work.artifacts.length,'the report is completed from the available evidence');
+ assert.ok(f.mission.trace.some(item=>item.title==='Unverified page URL replaced with a source search'));
 });
 test('an oversized snapshot falls back to the complete repository tree and continues',async()=>{
  const f=fixture();f.mission.goal='Review the repository';let snapshotCalls=0,treeCalls=0;
@@ -205,6 +342,88 @@ test('chat proposals draft their message from retrieved evidence instead of plan
  assert.equal(proposalArgs.text,'The earlier decision rejected this because the priority was zero.');
  assert.equal(f.mission.work.proposals[0].text,proposalArgs.text);
 });
+test('issue-derived proposal is blocked when GitHub issue searches returned no issue records',async()=>{
+ const f=fixture();f.mission.goal='Compare both GitHub issues, recommend which to prioritize, and draft an issue for the highest-priority improvement.';
+ let writes=0,draftCalls=0;
+ const issueTool={name:'propose_github_issue',description:'Prepare GitHub issue',effect:'propose',inputSchema:schema({repository:{type:'string'},title:{type:'string'},body:{type:'string'}})};
+ f.workTools.list=()=>[...catalog,issueTool];
+ f.provider.planWork=async()=>({status:'ready',summary:'Search issues and propose an improvement',steps:[
+  {id:'search',title:'Search for the referenced issues',tool:'web_search',args:{query:'the complete user request'},dependsOn:[]},
+  {id:'proposal',title:'Draft the highest-priority improvement',tool:issueTool.name,args:{repository:'owner/demo',title:'',body:''},dependsOn:['search']},
+ ]});
+ const original=f.workTools.call;
+ f.workTools.call=async(name,args,context)=>{
+  if(name===issueTool.name){writes++;return {proposal:{id:'unexpected',status:'PENDING_APPROVAL'}};}
+  if(name==='web_search')return {source:'GitHub issues',observedAt:new Date().toISOString(),results:[{title:'GitHub issue search returned no matches',url:'https://github.com/owner/demo/issues',summary:'No issue records matched the search.'}]};
+  return original(name,args,context);
+ };
+ f.provider.draftAction=async()=>{draftCalls++;return {status:'ready',content:'An unsupported issue draft.',sourceIds:[f.mission.work.evidence[0].id]};};
+ f.provider.synthesizeWork=async({evidence})=>({answer:'No issue records were returned, so the requested comparison and derived issue cannot be completed.',title:'Issue search limitation',sourceIds:[evidence[0].id]});
+ await runWorkMission(f);
+ assert.equal(f.mission.state,'BLOCKED');assert.equal(draftCalls,0);assert.equal(writes,0);
+ assert.equal(f.mission.work.steps.find(step=>step.id==='proposal').status,'blocked');
+ assert.equal(f.mission.work.steps.find(step=>step.id==='proposal').retryable,false);
+ assert.equal(f.mission.clarificationCount,1);
+ assert.equal(f.mission.inputRequest.question,'Which open GitHub issues should MOVA compare?');
+ assert.deepEqual(f.mission.inputRequest.options,['Provide the two issue URLs or numbers.','Correct the repository owner/name and provide the issue URLs or numbers.']);
+ assert.match(f.mission.work.answer,/No issue records were returned/);
+ assert.ok(f.mission.trace.some(item=>item.title==='Issue proposal withheld'));
+ await runWorkMission(f);
+ assert.equal(draftCalls,0,'resuming does not retry a proposal with unchanged evidence');
+ assert.equal(writes,0);
+});
+test('provider-blocked proposals do not repeat on resume',async()=>{
+ const f=fixture();let draftCalls=0,proposalWrites=0;
+ const tool={name:'propose_discord_message',description:'Prepare Discord message',effect:'propose',inputSchema:schema({channelId:{type:'string'},text:{type:'string'}})};
+ f.workTools.list=()=>[...catalog,tool];
+ f.provider.planWork=async()=>({status:'ready',steps:[
+  {id:'read',title:'Read evidence',tool:'web_search',args:{query:'supporting source'},dependsOn:[]},
+  {id:'reply',title:'Prepare Discord reply',tool:tool.name,args:{channelId:'channel-1',text:''},dependsOn:['read']},
+ ]});
+ f.provider.draftAction=async({evidence})=>{draftCalls++;return {status:'blocked',content:'The sources do not support a useful reply.',sourceIds:[evidence[0].id]};};
+ const original=f.workTools.call;f.workTools.call=async(name,args,context)=>{if(name===tool.name)proposalWrites++;return original(name,args,context);};
+ await runWorkMission(f);
+ assert.equal(f.mission.state,'BLOCKED');assert.equal(draftCalls,1);assert.equal(proposalWrites,0);
+ assert.equal(f.mission.work.steps.find(step=>step.id==='reply').retryable,false);
+ await runWorkMission(f);
+ assert.equal(draftCalls,1);assert.equal(proposalWrites,0);
+});
+test('GitHub comment plans defer missing or empty body until evidence-backed drafting',async()=>{
+ for(const plannedBody of [undefined,'']){
+  const f=fixture();let proposalArgs;
+  const tool={name:'propose_github_issue_comment',description:'Prepare GitHub issue reply',effect:'propose',inputSchema:{...schema({repository:{type:'string',minLength:1},issueNumber:{type:'integer',minimum:1},body:{type:'string',minLength:1,maxLength:5000}}),required:['repository','issueNumber','body']}};
+  f.workTools.list=()=>[...catalog,tool];
+  f.provider.planWork=async()=>({status:'ready',summary:'Read evidence and prepare reply',steps:[
+   {id:'read',title:'Read supporting evidence',tool:'web_search',args:{query:'verified issue context'},dependsOn:[]},
+   {id:'draft_comment',title:'Prepare issue comment',tool:tool.name,args:{repository:'owner/repo',issueNumber:42,...(plannedBody===undefined?{}:{body:plannedBody})},dependsOn:['read']},
+  ]});
+  f.provider.draftAction=async({evidence})=>({content:'A source-backed reply.',sourceIds:[evidence[0].id]});
+  const original=f.workTools.call;
+  f.workTools.call=async(name,args,context)=>name===tool.name?(proposalArgs=args,{proposal:{id:'comment-proposal',service:'github',operation:'comment_on_issue',status:'PENDING_APPROVAL',createdAt:new Date().toISOString(),...args}}):original(name,args,context);
+  await runWorkMission(f);
+  assert.equal(proposalArgs.body,'A source-backed reply.');
+  assert.equal(f.mission.work.proposals[0].body,proposalArgs.body);
+  assert.equal(f.mission.state,'BLOCKED','the proposal remains approval-gated');
+ }
+});
+test('invalid generated GitHub comment content is rejected before proposal execution',async()=>{
+ const f=fixture();let proposalCalls=0,draftCalls=0;
+ const tool={name:'propose_github_issue_comment',description:'Prepare GitHub issue reply',effect:'propose',inputSchema:{...schema({repository:{type:'string',minLength:1},issueNumber:{type:'integer',minimum:1},body:{type:'string',minLength:1,maxLength:5000}}),required:['repository','issueNumber','body']}};
+ f.workTools.list=()=>[...catalog,tool];
+ f.provider.planWork=async()=>({status:'ready',steps:[
+  {id:'read',title:'Read supporting evidence',tool:'web_search',args:{query:'verified issue context'},dependsOn:[]},
+  {id:'draft_comment',title:'Prepare issue comment',tool:tool.name,args:{repository:'owner/repo',issueNumber:42,body:''},dependsOn:['read']},
+ ]});
+ f.provider.draftAction=async({evidence})=>{draftCalls++;return {content:'  \n ',sourceIds:[evidence[0].id]};};
+ const original=f.workTools.call;
+ f.workTools.call=async(name,args,context)=>name===tool.name?(proposalCalls++,{proposal:{id:'invalid-comment',service:'github',operation:'comment_on_issue',status:'PENDING_APPROVAL',createdAt:new Date().toISOString(),...args}}):original(name,args,context);
+ await runWorkMission(f);
+ assert.equal(draftCalls,1,'invalid generated content is not retried automatically');
+ assert.equal(proposalCalls,0);
+ assert.equal(f.mission.work.steps.find(step=>step.id==='draft_comment').status,'failed');
+ assert.match(f.mission.work.lookupNotes[0],/empty or whitespace-only evidence-backed action content/);
+ assert.equal(f.mission.work.proposals.length,0);
+});
 test('commit proposals derive reviewed file contents from retrieved evidence',async()=>{
  const f=fixture();let proposalArgs;
  f.workTools.list=()=>[...catalog,{name:'propose_github_commit',description:'Prepare commit',effect:'propose',inputSchema:schema({repository:{type:'string'},branch:{type:'string'},message:{type:'string'},files:{type:'array'}})}];
@@ -227,6 +446,32 @@ test('approved proposals execute exactly once and rejected proposals never execu
 });
 test('unavailable capabilities and cyclic plans fail before tool execution',()=>{
  assert.throws(()=>validateWorkPlan({status:'blocked',summary:'Purchasing is unavailable',steps:[]},catalog),/Purchasing/);const p=plan();p.steps[0].dependsOn=['report'];assert.throws(()=>validateWorkPlan(p,catalog),/cycle/);p.steps[0].dependsOn=[];p.steps[0].tool='shell';assert.throws(()=>validateWorkPlan(p,catalog),/unavailable/);
+});
+test('work plan rejects arguments that do not match the selected tool schema before execution',()=>{
+ const tools=[{name:'read_github_issues',inputSchema:schema({repository:{type:'string'},state:{type:'string',enum:['open','closed','all']},limit:{type:'integer'}})}];
+ const make=args=>({status:'ready',steps:[{id:'search',title:'Search issues',tool:'read_github_issues',args,dependsOn:[]}]});
+ tools[0].inputSchema.required=['repository'];
+ assert.throws(()=>validateWorkPlan(make({state:'open'}),tools),/Missing required argument repository/);
+ assert.throws(()=>validateWorkPlan(make({repository:42}),tools),/Invalid argument type for repository/);
+ assert.throws(()=>validateWorkPlan(make({repository:'owner/repo',state:'merged'}),tools),/Invalid argument value for state/);
+ assert.throws(()=>validateWorkPlan(make({repository:'owner/repo',unexpected:true}),tools),/Unexpected argument/);
+ assert.equal(validateWorkPlan(make({repository:'owner/repo',state:'open',limit:5}),tools)[0].status,'pending');
+});
+test('work plan validates declared string, numeric, array-item, and nested-object constraints',()=>{
+ const tools=[{name:'propose_github_commit',inputSchema:schema({
+  repository:{type:'string',minLength:1,maxLength:200},
+  files:{type:'array',minItems:1,maxItems:2,items:{type:'object',properties:{path:{type:'string',minLength:1,maxLength:500},content:{type:'string',maxLength:20}},required:['path','content'],additionalProperties:false}},
+  limit:{type:'integer',minimum:1,maximum:10},
+ })}];
+ const make=args=>({status:'ready',steps:[{id:'commit',title:'Prepare commit',tool:'propose_github_commit',args,dependsOn:[]}]});
+ const valid={repository:'owner/repo',files:[{path:'src/app.js',content:'ok'}],limit:2};
+ assert.equal(validateWorkPlan(make(valid),tools)[0].status,'pending');
+ assert.throws(()=>validateWorkPlan(make({...valid,repository:''}),tools),/at least 1 characters/);
+ assert.throws(()=>validateWorkPlan(make({...valid,limit:11}),tools),/at most 10/);
+ assert.throws(()=>validateWorkPlan(make({...valid,files:[]}),tools),/at least 1 items/);
+ assert.throws(()=>validateWorkPlan(make({...valid,files:[{path:4,content:'ok'}]}),tools),/Invalid argument type.*files\[0\]\.path/);
+ assert.throws(()=>validateWorkPlan(make({...valid,files:[{path:'a',content:'ok',unexpected:true}]}),tools),/property is not allowed/);
+ assert.throws(()=>validateWorkPlan(make({...valid,files:[{path:'a'}]}),tools),/required property is missing/);
 });
 test('code reads and commit proposals are valid graph-planned work tools',()=>{
  const tools=['read_github_code','propose_github_commit','analyze_falkordb_impact'].map(name=>({name}));

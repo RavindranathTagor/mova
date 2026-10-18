@@ -55,13 +55,14 @@ const definitions=[
  ['get_calendar_events','Read calendar events using the already-authorized calendar adapter.',{},[]],
 ].map(([name,description,properties,required])=>({name,description,inputSchema:{type:'object',properties,required,additionalProperties:false},effect:name==='save_artifact'?'write':'read'}));
 
-export function createWorkTools({env=process.env,dataDir=env.MOVA_DATA_DIR||'.data',adapters={},operationsGraph=null,lookupImpl=lookup,requestImpl=transport,fetchImpl=fetch}={}){
+export function createWorkTools({env=process.env,dataDir=env.MOVA_DATA_DIR||'.data',adapters={},operationsGraph=null,lookupImpl=lookup,requestImpl=transport,fetchImpl=fetch,discordMentionState={checkedAt:null,errors:[]}}={}){
  const artifactDir=resolve(dataDir,'artifacts');
  const allowedIds=name=>new Set(String(env[name]||'').split(',').map(value=>value.trim()).filter(Boolean));
  const graphContentAllowed=env.MOVA_GRAPH_DATA_ATTESTATION==='public_or_owned';
  const slackChannels=allowedIds('SLACK_ALLOWED_CHANNEL_IDS');
  const discordChannels=allowedIds('DISCORD_ALLOWED_CHANNEL_IDS');
  const githubRepositories=allowedIds('GITHUB_ALLOWED_REPOSITORIES');
+ if(!discordMentionState||typeof discordMentionState!=='object'||!Array.isArray(discordMentionState.errors))throw new TypeError('Invalid Discord mention status state.');
  const maximumSnapshotFiles=Math.max(1,Math.min(500,Number(env.MOVA_GITHUB_SNAPSHOT_MAX_FILES||120)||120));
  const maximumSnapshotBytes=Math.max(100000,Math.min(5000000,Number(env.MOVA_GITHUB_SNAPSHOT_MAX_BYTES||1000000)||1000000));
  const chatEvidenceGuard=(channelId,channels,label)=>{
@@ -217,15 +218,25 @@ export function createWorkTools({env=process.env,dataDir=env.MOVA_DATA_DIR||'.da
  }
  async function listMentions(){
   const events=[];
+  discordMentionState.errors.length=0;
   const slackBot=String(env.SLACK_BOT_USER_ID||'').trim();
   if(env.SLACK_BOT_TOKEN&&slackChannels.size&&graphContentAllowed)for(const channelId of slackChannels){
    try{const feed=await slackChannel(channelId);for(const item of feed.results){const tagged=/(^|\s)@mova\b/i.test(item.summary)||(slackBot&&item.mentionText?.includes(`<@${slackBot}>`));if(tagged)events.push({eventId:`slack:${channelId}:${item.id}`,service:'Slack',source:`Slack channel ${channelId}`,channelId,authorId:item.authorId||'',content:item.mentionText||item.summary,observedAt:item.observedAt});}}catch{}
   }
   const discordBot=String(env.DISCORD_BOT_USER_ID||'').trim();
   if(env.DISCORD_BOT_TOKEN&&discordChannels.size&&graphContentAllowed)for(const channelId of discordChannels){
-   try{const feed=await discordChannel(channelId);for(const item of feed.results){const tagged=/(^|\s)@mova\b/i.test(item.summary)||(discordBot&&item.mentionIds?.includes(discordBot));if(tagged)events.push({eventId:`discord:${channelId}:${item.id}`,service:'Discord',source:`Discord channel ${channelId}`,channelId,authorId:item.authorId||'',content:item.mentionText||item.summary,observedAt:item.observedAt});}}catch{}
+   try{const feed=await discordChannel(channelId);for(const item of feed.results){const tagged=/(^|\s)@mova\b/i.test(item.summary)||(discordBot&&item.mentionIds?.includes(discordBot));if(tagged)events.push({eventId:`discord:${channelId}:${item.id}`,service:'Discord',source:`Discord channel ${channelId}`,channelId,authorId:item.authorId||'',content:item.mentionText||item.summary,observedAt:item.observedAt});}}catch(error){const detail=String(error?.message||'Discord channel request failed.').replaceAll(String(env.DISCORD_BOT_TOKEN||''),'[redacted]').slice(0,180);discordMentionState.errors.push(`Channel ${channelId}: ${detail}`);}
   }
+  discordMentionState.checkedAt=stamp();
   return [...events,...await githubMentions()].filter(event=>event.eventId&&Number.isFinite(Date.parse(event.observedAt))).sort((a,b)=>Date.parse(a.observedAt)-Date.parse(b.observedAt));
+ }
+ function getDiscordMentionStatus(){
+  if(!env.DISCORD_BOT_TOKEN)return {status:'disconnected',detail:'Discord mention monitoring is not configured: add a bot token.',checkedAt:discordMentionState.checkedAt};
+  if(!discordChannels.size)return {status:'disconnected',detail:'Discord mention monitoring has no allowlisted channels.',checkedAt:discordMentionState.checkedAt};
+  if(!graphContentAllowed)return {status:'disconnected',detail:'Discord mention monitoring is disabled until public-or-owned graph data is attested.',checkedAt:discordMentionState.checkedAt};
+  if(!discordMentionState.checkedAt)return {status:'checking',detail:'Checking the connected Discord channels for mentions.',checkedAt:null};
+  if(discordMentionState.errors.length)return {status:'unavailable',detail:discordMentionState.errors.join(' ').slice(0,500),checkedAt:discordMentionState.checkedAt};
+  return {status:'connected',detail:'Connected Discord channels were checked successfully.',checkedAt:discordMentionState.checkedAt};
  }
  async function listCustomerReports(){
   if(!env.DISCORD_BOT_TOKEN||!discordChannels.size||!graphContentAllowed)return [];
@@ -409,6 +420,6 @@ export function createWorkTools({env=process.env,dataDir=env.MOVA_DATA_DIR||'.da
    }
    if(!adapters.getCalendarEvents)throw new Error('Calendar adapter is not connected');
    const result=await adapters.getCalendarEvents();return {...result,source:result.source||'Google Calendar',observedAt:result.observedAt||stamp(),evidenceKind:'observed'};
-  }, executeProposal, listMentions, listCustomerReports,
+  }, executeProposal, listMentions, listCustomerReports, getDiscordMentionStatus,
  };
 }
