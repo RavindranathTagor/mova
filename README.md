@@ -2,7 +2,38 @@
 
 **MOVA turns a request into a traceable investigation across connected sources.** It gathers real evidence, records how that evidence relates to decisions and actions in FalkorDB, and presents a result with source references. External write operations are prepared as proposals and require explicit approval.
 
-> **Project status:** MOVA is a local, single-user prototype. The repository does not claim production multi-user isolation, a transactional workflow engine, or automatic execution of unapproved external actions.
+
+
+## Why FalkorDB is central
+
+Most autonomous bots can call tools. The harder question is: **what evidence lets an agent act, and can a human inspect that reasoning afterwards?**
+
+MOVA is a connected-data agent whose operating memory and decision substrate is FalkorDB. It turns Discord reports, GitHub code, commits, issues, prior decisions, and pending actions into a graph. FalkorDB controls which investigative tool is allowed to run, answers multi-hop impact questions, preserves incident memory, and exposes the evidence path behind every proposed external action.
+
+This is not an LLM plus a graph visualization. The model proposes a bounded plan; FalkorDB stores the plan and connected evidence, gates dispatch, runs impact retrieval, and makes the graph visible. GitHub issues, Discord posts, and Git commits remain reviewable proposals until a user explicitly approves them.
+
+```mermaid
+flowchart LR
+  D[Discord customer report] -->|REPORTS| I[Incident]
+  I -->|TRACKED_BY| G[GitHub issue]
+  R[Repository] -->|CONTAINS| F1[RepositoryFile: changed file]
+  F2[RepositoryFile: dependent file] -->|IMPORTS| F1
+  M[Mission] -->|HAS_STEP| S[Step]
+  S -->|SUPPORTED_BY| E[Evidence]
+  Gate[FalkorDB dispatch gate] -->|GATES| S
+  M -->|PROPOSES| P[Action proposal]
+  P -->|DERIVED_FROM| S
+```
+
+| FalkorDB decision | Relationship traversal | What MOVA does |
+| --- | --- | --- |
+| Dispatch | `Step -> DEPENDS_ON -> Step -> SUPPORTED_BY -> Evidence` | Releases only a tool whose prerequisites have qualifying evidence. |
+| Code blast radius | `RepositoryFile -[:IMPORTS*1..8]-> changed file` | Finds direct and transitive source files affected by a change, with hop/path counts. |
+| Incident duplicate | `CustomerReport -> Incident -> GitHubIssue` | Reuses the known issue instead of blindly creating another one. |
+| Persistent recall | `AgentMemory -> ConnectedResource` and `MemoryEvidence` | Reuses scoped prior context without asking again for configured resources. |
+| Action explanation | `Mission -> ActionProposal -> Step -> Evidence` | Shows why a GitHub or Discord write is proposed before approval. |
+
+
 
 ## Contents
 
