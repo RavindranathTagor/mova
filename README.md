@@ -423,7 +423,7 @@ curl -s http://127.0.0.1:3001/api/connectors
 | `MOVA_GRAPH_DATA_ATTESTATION` | Explicit confirmation for Discord/Slack data ingestion into graph storage. | Required for chat connectors; use `public_or_owned` only when accurate. |
 | `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_CHANNEL_IDS`, `SLACK_BOT_USER_ID` | Slack read/mention and proposal connector settings. | Optional; bot token and channel allowlist required for channel access. |
 | `DISCORD_BOT_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_BOT_USER_ID` | Discord read/mention and proposal connector settings. | Optional; bot token and channel allowlist required for channel access. |
-| `MOVA_MENTION_POLL_SECONDS`, `MOVA_MENTION_MAX_AGE_MINUTES` | Connected mention polling interval and accepted event age. | Optional; defaults are 45 seconds and 10 minutes, bounded by code. |
+| `MOVA_MENTION_POLL_SECONDS`, `MOVA_MENTION_MAX_AGE_MINUTES` | Connected mention polling interval and accepted event age. | Optional; defaults are 10 seconds and 10 minutes, bounded by code. |
 | `TRACCAR_URL`, `TRACCAR_DEVICE_ID`, `TRACCAR_TOKEN`, `TRACCAR_USERNAME`, `TRACCAR_PASSWORD`, `TRACCAR_POLL_INTERVAL_MS`, `TRACCAR_INGEST_BIND` | Optional phone tracking service URL, selected numeric device, auth, polling interval and upload bind. | Device ID plus supported credentials are needed for polling. Defaults target local service and 15 seconds. Do not expose ingress beyond a trusted LAN. |
 | `OPEN_METEO_BASE_URL` | Weather endpoint base URL. | Optional; template public endpoint. |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | Optional voice list and speech synthesis. | Optional; requires account key and available voice. |
