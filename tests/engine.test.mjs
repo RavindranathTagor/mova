@@ -21,6 +21,14 @@ async function fixture(t,options={}){
 test('live is the default and unsupported modes and arbitrary events are unavailable',async t=>{
  const f=await fixture(t);const s=await f.engine.createMission(input);assert.equal(s.mission.mode,'live');assert.equal(s.mission.state,'AWAITING_APPROVAL');assert.equal(f.engine.injectEvent,undefined);await assert.rejects(f.engine.createMission({...input,mode:'demo'}),/Only live/);
 });
+test('duplicate connected mention events do not create duplicate missions',async t=>{
+ const f=await fixture(t);const trigger={service:'Discord',source:'Discord channel 123456789012345678',channelId:'123456789012345678',eventId:'discord:123456789012345678:message-1',content:'@MOVA investigate this',observedAt:new Date().toISOString()};
+ const first=await f.engine.createMission({...input,trigger},{background:true});
+ const duplicate=await f.engine.createMission({...input,trigger},{background:true});
+ assert.equal(first.mission.id,duplicate.mission.id);
+ assert.equal(f.engine.getState().missions.length,1);
+ assert.equal(f.engine.getState().mission.trace.filter(item=>item.title==='Mission created').length,1);
+});
 test('navigation approval is idempotent and opened acknowledgement does not resolve arrival',async t=>{
  const f=await fixture(t);let s=await f.engine.createMission(input);await Promise.all([f.engine.approve(s.mission.id,s.mission.revision),f.engine.approve(s.mission.id,s.mission.revision)]);s=f.engine.getState();assert.equal(f.calls(),1);assert.equal(s.mission.state,'VERIFYING');assert.equal(s.mission.receipts[0].status,'UNVERIFIED');assert.ok(s.mission.receipts[0].navigationTarget);s=await f.engine.acknowledge(s.mission.id,{receiptId:s.mission.receipts[0].id,outcome:'opened'});assert.equal(s.mission.state,'VERIFYING');
  s=await f.engine.setLocation({...destination,accuracy:25,timestamp:Date.now()});assert.equal(s.mission.state,'RESOLVED');assert.ok(s.mission.graph.edges.some(e=>e.label==='VERIFIED_BY'));
@@ -82,6 +90,32 @@ test('late observed arrival cannot resolve an expired protected deadline',async 
 });
 test('interrupted actions become unknown on restart and legacy live missions gain travel kind',async t=>{
  const f=await fixture(t);let s=await f.engine.createMission(input);const saved=await f.store.load();const m=saved.missions[0];delete m.kind;m.state='EXECUTING';m.receipts=[{id:'pending',status:'PENDING'}];await f.store.save(saved);await f.engine.init();s=f.engine.getState();assert.equal(s.mission.kind,'travel');assert.equal(s.mission.state,'UNKNOWN');assert.equal(s.mission.receipts[0].status,'UNKNOWN');
+});
+test('a request interrupted during intent classification is blocked and can be retried without changing its ID',async t=>{
+ let compileCalls=0;
+ const f=await fixture(t,{provider:{compileIntent:async()=>{compileCalls++;return {kind:'unsupported',destinationQuery:'',summary:'This request is not supported by connected tools.'};}}});
+ let state=await f.engine.createMission({text:'A connected-data request interrupted during classification'});
+ const id=state.mission.id;
+ const saved=await f.store.load(),mission=saved.missions.find(item=>item.id===id);
+ mission.kind='pending';delete mission.intent;mission.state='INVESTIGATING';mission.summary='Kiro is interpreting your request and checking supported tools.';
+ await f.store.save(saved);await f.engine.init();
+ state=f.engine.getState();
+ assert.equal(state.mission.id,id);assert.equal(state.mission.state,'BLOCKED');
+ assert.match(state.mission.summary,/interrupted while interpreting.*Retry/i);
+ assert.equal(state.mission.graph.nodes.length,0);
+ assert.ok(state.mission.trace.some(item=>item.title==='Request interpretation interrupted'));
+ state=await f.engine.resume(id);
+ assert.equal(state.mission.id,id);assert.equal(state.mission.state,'BLOCKED');
+ assert.match(state.mission.summary,/not supported by connected tools/i);
+ assert.equal(compileCalls,2);
+});
+test('intent provider failures end in a visible blocked mission with the actual failure detail',async t=>{
+ const f=await fixture(t,{provider:{compileIntent:async()=>{throw new Error('Kiro CLI request timed out. No model decision was made.');}}});
+ const state=await f.engine.createMission({text:'Research a connected repository'});
+ assert.equal(state.mission.state,'BLOCKED');
+ assert.match(state.mission.summary,/Kiro CLI request timed out/);
+ assert.ok(state.mission.trace.some(item=>item.kind==='error'&&/Kiro CLI request timed out/.test(item.detail)));
+ assert.equal(state.mission.graph.nodes.length,0);
 });
 test('fresh origin updates drive route observation and repeated reads are throttled',async t=>{
  let reads=0,latest;const f=await fixture(t,{adapters:{calculateRoutes:async({origin})=>{reads++;latest=origin;return testRoutes();}}});let s=await f.engine.createMission(input);s=await f.engine.approve(s.mission.id,s.mission.revision);await f.engine.setLocation({latitude:28.62,longitude:77.19,accuracy:20,timestamp:Date.now()});s=await f.engine.observeRoutes(s.mission.id);assert.equal(latest.latitude,28.62);assert.equal(s.mission.state,'VERIFYING');await f.engine.observeRoutes(s.mission.id);assert.equal(reads,2);
@@ -160,7 +194,7 @@ test('work context updates invalidate old evidence and rerun only the revised pl
  let reads=0;const workTools={list:()=>[{name:'web_search',description:'Search',inputSchema:{type:'object',properties:{query:{type:'string'}}}}],call:async()=>({source:'Search fixture',observedAt:new Date().toISOString(),results:[{title:'Result '+(++reads),snippet:'Evidence from the current query'}]})};
  const workGraph={sync:async()=>{},snapshot:async()=>({nodes:[],edges:[]}),ready:async m=>({stepIds:m.work.steps.filter(s=>s.status==='pending').map(s=>s.id),query:'ready',params:{}})};
  const f=await fixture(t,{workTools,workGraph,provider:{compileIntent:async()=>({kind:'work',goal:'Research a topic',destinationQuery:'',summary:'Research'}),planWork:async()=>({status:'ready',summary:'Research',steps:[{id:'read',title:'Search',tool:'web_search',args:{query:'topic'},dependsOn:[]}]}),synthesizeWork:async({evidence})=>({answer:'Supported finding',title:'Research',sourceIds:[evidence[0].id]})}});
- let s=await f.engine.createMission({text:'Research a topic'});assert.equal(s.mission.kind,'work');assert.equal(s.mission.state,'RESOLVED');assert.equal(reads,1);s=await f.engine.updateWorkContext(s.mission.id,'Focus on a different constraint');assert.equal(s.mission.state,'RESOLVED');assert.equal(reads,2);assert.equal(s.mission.work.evidence[0].stale,true);assert.equal(s.mission.work.evidence.at(-1).stale,false);assert.equal(s.mission.revision,1);
+ let s=await f.engine.createMission({text:'Research a topic'});assert.equal(s.mission.kind,'work');assert.equal(s.mission.state,'RESOLVED');assert.equal(reads,1);s=await f.engine.updateWorkContext(s.mission.id,'Focus on a different constraint');assert.equal(s.mission.state,'RESOLVED');assert.equal(reads,2);assert.equal(s.mission.work.evidence[0].stale,true);assert.equal(s.mission.work.evidence.at(-1).stale,false);assert.equal(s.mission.revision,1);assert.equal(s.mission.clarificationCount,1);
 });
 
 test('an existing Discord issue request blocked as unsupported is reclassified and resumed as work',async t=>{

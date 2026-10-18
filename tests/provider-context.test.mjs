@@ -31,6 +31,18 @@ test('planner compaction retains exact graph paths and edge identity while exclu
   assert.ok(JSON.stringify(payload).length < 12000);
 });
 
+test('work planner does not invent page URLs for future web search results',async()=>{
+ let payload;
+ const provider=createProvider({env:{GROQ_API_KEY:'test'},fetchImpl:async(_,init)=>{
+  payload=JSON.parse(init.body);
+  return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({status:'ready',summary:'Research source-backed findings',steps:[]})}}]})};
+ }});
+ await provider.planWork({text:'Research a dependency in the connected repository',tools:[],evidence:[],connectedResources:{},previousContext:[],contextUpdates:[]});
+ assert.match(payload.messages[0].content,/read_web_page only for an exact HTTPS URL present in the user request or current non-stale evidence/i);
+ assert.match(payload.messages[0].content,/Do not invent a URL or schedule a page read for a URL expected from a future web_search result/i);
+ assert.match(payload.messages[0].content,/read_github_code only for a file path explicitly named by the user or confirmed by current repository tree or file-listing evidence/i);
+});
+
 test('oversized essential evidence is rejected before contacting the model', async () => {
   let called = false;
   const provider = createProvider({ env: { GROQ_API_KEY: 'test' }, fetchImpl: async () => { called = true; } });
@@ -53,8 +65,14 @@ test('approval-gated GitHub and Discord requests remain supported work when mode
  assert.match(payload.messages[0].content,/prepare an approval-gated proposal/i);
 });
 test('GitHub issue drafts use the user supplied feature scope and remain approval gated',async()=>{
- let payload;const provider=createProvider({env:{GROQ_API_KEY:'test'},fetchImpl:async(_,init)=>{payload=JSON.parse(init.body);return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({content:'Describe the requested architecture design. Agree implementation details during team review.',sourceIds:['repo-evidence']})}}]})};}});
+ let payload;const provider=createProvider({env:{GROQ_API_KEY:'test'},fetchImpl:async(_,init)=>{payload=JSON.parse(init.body);return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({status:'ready',content:'Describe the requested architecture design. Agree implementation details during team review.',sourceIds:['repo-evidence']})}}]})};}});
  const evidence=[{id:'repo-evidence',title:'GitHub repository overview',source:'GitHub API',observedAt:new Date().toISOString(),summary:'The Agents Playground repository contains agent examples.'}];
  const draft=await provider.draftAction({text:'Create an issue for feature 1 system architecture design.',action:'propose_github_issue',target:{repository:'owner/agents-playground'},evidence});
- assert.equal(draft.content,'Describe the requested architecture design. Agree implementation details during team review.');assert.deepEqual(draft.sourceIds,['repo-evidence']);assert.match(payload.messages[0].content,/reviewable proposal that remains pending approval/i);assert.match(payload.messages[0].content,/Do not add invented technical requirements/i);
+ assert.equal(draft.status,'ready');assert.equal(draft.content,'Describe the requested architecture design. Agree implementation details during team review.');assert.deepEqual(draft.sourceIds,['repo-evidence']);assert.match(payload.messages[0].content,/explicit user approval/i);assert.match(payload.messages[0].content,/Do not invent requirements/i);
+});
+test('GitHub issue drafting can truthfully block when evidence does not support a proposal',async()=>{
+ const provider=createProvider({env:{GROQ_API_KEY:'test'},fetchImpl:async()=>({ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({status:'blocked',content:'No matching issue records were retrieved.',sourceIds:['empty-search']})}}]})})});
+ const evidence=[{id:'empty-search',title:'GitHub issue search returned no matches',source:'GitHub issues',observedAt:new Date().toISOString(),summary:'No matching issue records were retrieved.'}];
+ const draft=await provider.draftAction({text:'Compare issues and propose the highest-priority improvement.',action:'propose_github_issue',target:{repository:'owner/agents-playground'},evidence});
+ assert.equal(draft.status,'blocked');assert.equal(draft.content,'No matching issue records were retrieved.');
 });

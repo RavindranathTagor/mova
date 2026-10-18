@@ -331,6 +331,7 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
       }
       mission.originalGoal||=mission.goal;mission.contextUpdates.push({text:value,at:stamp()});
       mission.goal=`Original objective: ${mission.originalGoal}\nUpdates (oldest to newest):\n${mission.contextUpdates.slice(-8).map(item=>item.text).join('\n')}`;
+      mission.clarificationCount=Math.max(Number(mission.clarificationCount||0),1);
       mission.revision++;delete mission.inputRequest;mission.work||={steps:[],evidence:[],artifacts:[],proposals:[]};
       mission.work.evidence=mission.work.evidence.map(e=>({...e,stale:true}));mission.work.artifacts=mission.work.artifacts.map(a=>({...a,stale:true}));
       mission.work.proposals=(mission.work.proposals||[]).map(item=>item.status==='PENDING_APPROVAL'?{...item,status:'STALE',resolvedAt:stamp()}:item);
@@ -346,6 +347,14 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
       const proposal=mission.work.proposals.find(item=>item.id===proposalId);
       const summary=outcome==='reject'?'You rejected the proposed external action. Nothing was sent.':result.status==='VERIFIED'?`Approved ${proposal.service} action completed and was confirmed by the connector.`:'The approved action did not return a confirmed result.';
       mission.receipts.push({id:randomUUID(),tool:`${proposal.service}_${proposal.operation}`,status:result.status,at:stamp(),summary,revision,verification:{proposalId,source:result.source||null,remoteId:result.remoteId||null,url:result.url||null}});
+      if(outcome==='approve'&&result.status==='VERIFIED'){
+        const step=mission.work.steps.find(item=>item.id===proposal.stepId);
+        const evidenceId=`e-${revision}-approved-${proposal.id}`;
+        if(step&&!mission.work.evidence.some(item=>item.id===evidenceId)){
+          const issueNumber=proposal.operation==='create_issue'?(Number(result.remoteId||0)||Number(String(result.url||'').match(/\/issues\/(\d+)/)?.[1])||undefined):undefined;
+          mission.work.evidence.push({id:evidenceId,stepId:step.id,title:`${proposal.operation.replaceAll('_',' ')} verified`,...(issueNumber?{issueNumber}:{}),...(proposal.repository?{repository:proposal.repository}:{}),...(result.url?{url:result.url}:{}),source:result.source||`${proposal.service} action receipt`,observedAt:Number.isFinite(Date.parse(result.observedAt))?new Date(result.observedAt).toISOString():stamp(),evidenceKind:'observed',summary:`The user-approved ${proposal.operation.replaceAll('_',' ')} was confirmed by ${proposal.service}.${result.remoteId?` Remote ID: ${result.remoteId}.`:''}${result.url?` Receipt: ${result.url}`:''}`,stale:false});
+        }
+      }
       if(outcome==='approve'&&result.status==='VERIFIED'&&mission.operationalContext?.reportId&&operationsGraph){
         if(proposal.operation==='create_issue'){
           const issueNumber=Number(result.remoteId||0)||Number(String(result.url||'').match(/\/issues\/(\d+)/)?.[1]);
@@ -357,11 +366,33 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
         if(proposal.service==='discord'&&proposal.operation==='post_channel_message')await operationsGraph.recordNotificationReceipt({reportId:mission.operationalContext.reportId,id:`incident:${mission.operationalContext.reportId}:discord`,url:result.url||`discord:${result.remoteId||''}`});
       }
       trace(mission,outcome==='reject'?'decision':'action',outcome==='reject'?'Action proposal rejected':'Approved action completed',summary,{tool:`${proposal.service}_${proposal.operation}`,status:result.status,source:result.source});
-      await workGraph.sync(mission);mission.graph=await workGraph.snapshot(mission);await persist();return getState();
+      const work=mission.work;
+      const hasPendingProposals=work?.proposals?.some(item=>item.status==='PENDING_APPROVAL');
+      const hasBlockedSteps=work?.steps?.some(step=>step.status==='blocked');
+      if(outcome==='approve'&&result.status==='VERIFIED'&&!hasPendingProposals&&hasBlockedSteps){
+        delete work.synthesis;delete work.answer;delete work.completedAt;
+        await workGraph.sync(mission);mission.graph=await workGraph.snapshot(mission);await persist();
+        await investigate(mission);
+        return getState();
+      }
+      await workGraph.sync(mission);mission.graph=await workGraph.snapshot(mission);
+      // A pending approval is a valid reason for runWorkMission to finish in
+      // BLOCKED. Once the user resolves that proposal, clear the stale blocker
+      // when every work step and remaining proposal is otherwise complete.
+      const hasUnresolvedWork=work?.steps?.some(step=>['pending','running','failed','blocked'].includes(step.status))
+        ||work?.proposals?.some(item=>item.status==='PENDING_APPROVAL');
+      if(!hasUnresolvedWork&&work?.answer){
+        await transition(mission,'RESOLVED',outcome==='reject'
+          ?'The verified result is complete. The proposed external action was rejected and was not sent.'
+          :'The verified result and approved external action are complete.');
+        await workGraph.sync(mission);mission.graph=await workGraph.snapshot(mission);await persist();
+      }else await persist();
+      return getState();
     });},
     selectMission(id){return serialize(async()=>{find(id);await persist();return getState();});},
     async init(){state=await store.load();state.missions||=[];state.archivedMissions||=[];const savedCurrentId=state.currentId;const retired=state.missions.filter(m=>m.mode!=='live');state.archivedMissions.push(...retired);state.missions=state.missions.filter(m=>m.mode==='live');state.currentId=state.missions.some(m=>m.id===savedCurrentId)?savedCurrentId:null;await graph.init();for(const mission of state.missions){mission.kind||=mission.intent?.kind||'travel';
-      if(mission.kind==='work'&&['INVESTIGATING','BUILDING_CONTEXT','PLANNING','REPLANNING','EXECUTING','VERIFYING'].includes(mission.state)){mission.state='BLOCKED';mission.summary='The investigation was interrupted before completion. Resume to continue from its saved evidence.';mission.agentStatus='blocked';for(const step of mission.work?.steps||[])if(step.status==='running')step.status='pending';trace(mission,'state','Work investigation recovered after restart',mission.summary);}
+      if(mission.kind==='pending'&&['MISSION_CREATED','INVESTIGATING'].includes(mission.state)){mission.state='BLOCKED';mission.summary='MOVA was interrupted while interpreting this request. Retry to resume; no investigation result was recorded.';mission.agentStatus='blocked';trace(mission,'state','Request interpretation interrupted',mission.summary);}
+      else if(mission.kind==='work'&&['INVESTIGATING','BUILDING_CONTEXT','PLANNING','REPLANNING','EXECUTING','VERIFYING'].includes(mission.state)){mission.state='BLOCKED';mission.summary='The investigation was interrupted before completion. Resume to continue from its saved evidence.';mission.agentStatus='blocked';for(const step of mission.work?.steps||[])if(step.status==='running')step.status='pending';trace(mission,'state','Work investigation recovered after restart',mission.summary);}
       else if(mission.state==='EXECUTING'){mission.state='UNKNOWN';mission.summary='An action was interrupted. Its effect must be reconciled before retrying.';for(const receipt of mission.receipts)if(receipt.status==='PENDING')receipt.status='UNKNOWN';}
     }await persist();return getState();},
     createMission(input,{background=false}={}){return serialize(async()=>{
@@ -373,6 +404,7 @@ export function createEngine({graph,store,adapters={},provider,workTools,workGra
       if(budget!=null&&(!Number.isFinite(budget)||budget<0))throw errorWithStatus('Budget must be a non-negative number.');
       const trigger=input.trigger&&typeof input.trigger==='object'?{service:String(input.trigger.service||'').slice(0,100),source:String(input.trigger.source||'').slice(0,300),channelId:input.trigger.channelId?String(input.trigger.channelId).slice(0,100):null,repository:input.trigger.repository?String(input.trigger.repository).slice(0,200):null,issueNumber:Number.isInteger(input.trigger.issueNumber)?input.trigger.issueNumber:null,eventId:String(input.trigger.eventId||'').slice(0,200),authorId:String(input.trigger.authorId||'').slice(0,200),content:String(input.trigger.content||'').slice(0,4000),observedAt:input.trigger.observedAt&&Number.isFinite(Date.parse(input.trigger.observedAt))?new Date(input.trigger.observedAt).toISOString():stamp()}:null;
       if(trigger&&(!trigger.service||!trigger.source||!trigger.eventId))throw errorWithStatus('Invalid connected mention event.',400);
+      if(trigger&&[...state.missions,...state.archivedMissions].some(mission=>mission.trigger?.eventId===trigger.eventId))return getState();
       const suppliedContext=input.operationalContext&&typeof input.operationalContext==='object'?structuredClone(input.operationalContext):null;
       const operationalContext=suppliedContext;
       const incidentIntent=input.workflow||operationalContext?.channelId&&operationalContext?.repository?{kind:'work',goal:input.text.trim(),destinationQuery:'',summary:'Connected workflow selected.',successCriteria:'Complete the selected workflow using connected evidence.'}:null;
